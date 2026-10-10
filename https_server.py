@@ -3,6 +3,15 @@ import http.server, ssl, json
 state = {"received_indexes": [], "total": 0, "request_frame": -1}
 
 class QRStreamHandler(http.server.SimpleHTTPRequestHandler):
+    # 显式声明 .wasm 的 MIME 类型。
+    # 否则部分 Python / 操作系统会把 .wasm 当 application/octet-stream 返回，
+    # 浏览器 WebAssembly.instantiateStreaming 会失败并回退到较慢的 ArrayBuffer 实例化
+    # （虽然最终能加载，但首次可用时间被拉长）。
+    extensions_map = {
+        **http.server.SimpleHTTPRequestHandler.extensions_map,
+        '.wasm': 'application/wasm',
+    }
+
     def do_POST(self):
         content_length = int(self.headers.get('Content-Length', 0))
         post_data = {}

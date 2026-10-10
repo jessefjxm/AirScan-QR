@@ -15,3 +15,6 @@ build/
 DerivedData/
 ios-cfc-client/build/
 ios-cfc-client/DerivedData/
+
+# 「启动Cimbar离线模式.bat」生成的独立 Chrome 配置目录
+.chrome-cimbar-profile/

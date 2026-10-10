@@ -16,6 +16,11 @@
             -webkit-tap-highlight-color: transparent;
         }
 
+        /* 兜底：万一部署时没带 tailwind.min.js，隐藏 / 显示逻辑仍然必须正确工作 */
+        .hidden {
+            display: none !important;
+        }
+
         /* Cimbar 画布样式 */
         #cimbar-canvas {
             display: block;
@@ -48,6 +53,44 @@
             border-radius: 24px;
             overflow: hidden;
             background: #0f172a;
+        }
+
+        /* 屏幕捕获模式：画面通常是 16:9 窗口，同时隐藏摄像头用的准星 */
+        .scan-overlay.screen-mode {
+            aspect-ratio: 16 / 9;
+        }
+
+        .scan-overlay.screen-mode .crosshair {
+            display: none;
+        }
+
+        /* 大画面模式：编码区脱离卡片、铺满视口。
+           用纯 CSS 实现，不依赖 Fullscreen API（后者在部分环境/嵌入式浏览器里会失败或卡住），
+           所以「画面更大」这个关键能力在任何环境下都必定可用。 */
+        #encodingBox.fullbleed {
+            position: fixed;
+            inset: 0;
+            z-index: 60;
+            margin: 0;
+            border-radius: 0;
+            overflow: auto;
+            background: #0f172a;
+            padding: 8px;
+        }
+
+        /* 大画面下把统计压成两列、隐藏提示段落，把纵向空间尽量留给色码 */
+        #encodingBox.fullbleed #encodeStats {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 2px 18px;
+        }
+
+        #encodingBox.fullbleed #encodeStats .hint {
+            display: none;
+        }
+
+        #encodingBox.fullbleed #encodeStats .text-slate-500 {
+            color: #94a3b8;
         }
 
         .scan-video {
@@ -143,6 +186,11 @@
 <body class="bg-gray-50 min-h-screen text-slate-900 pb-20">
 
     <div class="max-w-xl mx-auto px-4 pt-8">
+        <!-- 运行环境警告（file:// 打开时显示） -->
+        <div id="protoWarn"
+            class="hidden mb-4 p-4 bg-amber-100 border border-amber-300 rounded-2xl text-xs text-amber-800 font-bold leading-relaxed">
+        </div>
+
         <!-- 标题栏 -->
         <div class="flex justify-between items-center mb-8">
             <h1 class="text-2xl font-black text-slate-800 tracking-tighter">Cimbar 传输</h1>
@@ -157,8 +205,19 @@
         <!-- 发送端面板 -->
         <div id="panel-send" class="space-y-4">
             <div class="bg-white p-6 rounded-[2rem] shadow-sm border border-gray-100">
+                <!-- 内容类型切换：文件 / 文本（固定在最上方，位置不随模式变化） -->
+                <div class="flex justify-between items-center mb-4">
+                    <label class="text-xs font-bold text-slate-500">传输内容</label>
+                    <div class="bg-gray-100 p-1 rounded-2xl flex text-xs font-bold">
+                        <button id="kind-file" onclick="setInputKind('file')"
+                            class="px-4 py-1.5 rounded-xl bg-white shadow-sm text-blue-600 transition-all">📎 文件</button>
+                        <button id="kind-text" onclick="setInputKind('text')"
+                            class="px-4 py-1.5 rounded-xl text-slate-500 transition-all">✏️ 文本</button>
+                    </div>
+                </div>
+
                 <!-- 文件选择区域 -->
-                <div class="relative mb-6">
+                <div id="fileBlock" class="relative mb-6">
                     <div id="dropZone"
                         class="w-full p-8 bg-gray-50 border-2 border-dashed border-gray-200 rounded-2xl text-center cursor-pointer hover:border-blue-400 transition-colors"
                         ondragover="event.preventDefault(); this.classList.add('border-blue-400');"
@@ -177,6 +236,17 @@
                     </div>
                 </div>
 
+                <!-- 文本输入区（文本模式） -->
+                <div id="textBlock" class="hidden mb-6">
+                    <textarea id="textInput" rows="6" oninput="onTextInput()"
+                        class="w-full p-4 bg-gray-50 border-2 border-gray-200 rounded-2xl text-sm font-mono resize-y focus:border-blue-400 focus:outline-none"
+                        placeholder="在此粘贴 / 输入要传输的文本（支持中文、emoji、多行）。接收端会直接在页面文本框里显示，不会产生下载文件。"></textarea>
+                    <div class="flex justify-between items-center mt-2">
+                        <span id="textStats" class="text-[10px] text-slate-400">0 字符 / 0 字节</span>
+                        <button onclick="clearText()" class="text-[10px] font-bold text-red-500 underline">清空文本</button>
+                    </div>
+                </div>
+
                 <!-- 配置选项 -->
                 <div class="space-y-4 mb-6">
                     <div>
@@ -192,11 +262,17 @@
 
                     <div>
                         <div class="flex justify-between items-center mb-2">
-                            <span class="text-xs font-bold text-slate-500">帧率</span>
-                            <span id="fpsDisplay" class="text-xs font-mono text-blue-600">15 FPS</span>
+                            <span class="text-xs font-bold text-slate-500">帧率（精确可调）</span>
+                            <div class="flex items-center gap-1">
+                                <input type="number" id="fpsNumber" min="1" max="30" step="0.5" value="15"
+                                    oninput="updateFPS(this.value)"
+                                    class="w-16 px-2 py-0.5 text-xs font-mono text-blue-600 border border-gray-200 rounded-lg text-right focus:border-blue-400 focus:outline-none">
+                                <span class="text-xs text-slate-400">FPS</span>
+                            </div>
                         </div>
-                        <input type="range" id="fpsRange" min="5" max="20" step="5" value="15" class="w-full"
+                        <input type="range" id="fpsRange" min="1" max="30" step="0.5" value="15" class="w-full"
                             oninput="updateFPS(this.value)">
+                        <p class="text-[10px] text-slate-400 mt-1">1–30 FPS，可填小数。接收端抓不稳就往下调（每帧停留更久）。</p>
                     </div>
                 </div>
 
@@ -208,26 +284,68 @@
             </div>
 
             <!-- 编码显示区域 -->
-            <div id="encodingBox" class="hidden bg-white p-6 rounded-none shadow-2xl border border-gray-50">
-                <div class="text-center mb-4">
-                    <div class="status-indicator bg-emerald-50 text-emerald-700">
-                        <div class="status-dot bg-emerald-500"></div>
-                        <span>正在编码传输</span>
+            <div id="encodingBox" class="hidden bg-white p-4 rounded-[2rem] shadow-2xl border border-gray-50">
+                <!-- 全屏时整个 stage 铺满屏幕；canvas 尺寸由 layoutCimbarCanvas() 严格按模式宽高比计算 -->
+                <div id="cimbarStage" class="bg-slate-900 rounded-2xl">
+                    <div class="flex justify-between items-center px-3 py-2">
+                        <div class="status-indicator bg-emerald-50 text-emerald-700">
+                            <div class="status-dot bg-emerald-500"></div>
+                            <span>正在编码传输</span>
+                        </div>
+                        <button id="btnFullscreen" onclick="toggleRealFullscreen()"
+                            class="px-3 py-1.5 bg-white/15 text-white rounded-full text-xs font-bold">
+                            ⛶ 真全屏（再大一点）
+                        </button>
+                    </div>
+
+                    <!-- 大画面里也要能调帧率，否则传输中没法微调 -->
+                    <div class="flex justify-between items-center px-3 pb-1">
+                        <div class="flex items-center gap-2">
+                            <span class="text-[10px] text-white/60">帧率</span>
+                            <input type="number" id="fpsNumberBig" min="1" max="30" step="0.5" value="15"
+                                oninput="updateFPS(this.value)"
+                                class="w-16 px-2 py-0.5 text-xs font-mono text-white bg-white/15 border border-white/20 rounded-lg text-right focus:outline-none">
+                            <span class="text-[10px] text-white/60">FPS</span>
+                        </div>
+                        <div class="text-[10px] text-white/70 font-mono">
+                            实测 <span id="fpsActualBig">—</span>
+                        </div>
+                    </div>
+
+                    <div class="flex justify-center items-center py-2">
+                        <canvas id="cimbar-canvas" width="400" height="400"></canvas>
                     </div>
                 </div>
 
-                <!-- Canvas 容器，添加内边距确保定位标记完整显示 -->
-                <div class="flex justify-center items-center py-2">
-                    <canvas id="cimbar-canvas" width="400" height="400" class="max-w-full h-auto rounded-none"></canvas>
-                </div>
-
-                <div class="mt-6 space-y-3">
-                    <div class="flex justify-between text-xs">
-                        <span class="text-slate-500">当前帧</span>
-                        <span id="frameCounter" class="font-mono font-bold">0</span>
+                <div class="mt-4">
+                    <div id="encodeStats" class="space-y-2">
+                        <div class="flex justify-between text-xs">
+                            <span class="text-slate-500">编码进度</span>
+                            <span id="encodeProgress" class="font-mono font-bold">等待开始</span>
+                        </div>
+                        <div class="flex justify-between text-xs">
+                            <span class="text-slate-500">已发送帧</span>
+                            <span id="frameCounter" class="font-mono font-bold">0</span>
+                        </div>
+                        <div class="flex justify-between text-xs">
+                            <span class="text-slate-500">实测帧率</span>
+                            <span id="fpsActual" class="font-mono font-bold text-slate-400">—</span>
+                        </div>
+                        <div class="flex justify-between text-xs">
+                            <span class="text-slate-500">单帧渲染耗时</span>
+                            <span id="renderCost" class="font-mono font-bold text-slate-400">—</span>
+                        </div>
+                        <div class="flex justify-between text-xs">
+                            <span class="text-slate-500">画面尺寸</span>
+                            <span id="canvasSize" class="font-mono font-bold text-slate-400">—</span>
+                        </div>
+                        <p class="hint text-[10px] text-slate-400 leading-relaxed">
+                            画面越大，接收端越容易一次看全 —— 这是清晰度的关键。
+                            若「实测帧率」明显低于设定值，说明显示器 / 远程桌面的刷新率跟不上，请调低帧率。
+                        </p>
                     </div>
                     <button onclick="stopEncoding()"
-                        class="w-full py-3 bg-red-500 text-white rounded-2xl font-bold text-sm">
+                        class="mt-3 w-full py-3 bg-red-500 text-white rounded-2xl font-bold text-sm">
                         ⏹ 停止传输
                     </button>
                 </div>
@@ -237,24 +355,33 @@
         <!-- 接收端面板 -->
         <div id="panel-receive" class="hidden space-y-4">
             <div class="bg-white p-6 rounded-[2rem] shadow-sm">
-                <!-- 摄像头预览 -->
-                <div class="scan-overlay mb-6">
+                <!-- 视频预览：摄像头 / 屏幕捕获共用 -->
+                <div id="scanOverlay" class="scan-overlay mb-6">
                     <video id="video" class="scan-video" autoplay playsinline muted></video>
                     <div id="crosshair1" class="crosshair tl"></div>
                     <div id="crosshair2" class="crosshair br"></div>
                 </div>
 
-                <!-- 控制按钮 -->
-                <div class="grid grid-cols-2 gap-3 mb-6">
+                <!-- 接收来源：摄像头 / 屏幕捕获 -->
+                <div class="flex justify-between items-center mb-3">
+                    <label class="text-xs font-bold text-slate-500">接收来源</label>
+                    <span class="text-[10px] text-slate-400">PC 互传请用「屏幕捕获」</span>
+                </div>
+                <div class="grid grid-cols-2 gap-3 mb-3">
                     <button id="btnCamera" onclick="toggleCamera()"
-                        class="py-4 bg-blue-600 text-white rounded-2xl font-bold shadow-lg text-sm">
+                        class="py-4 rounded-2xl font-bold text-sm transition-colors bg-gray-100 text-slate-600">
                         📷 启动摄像头
                     </button>
-                    <button onclick="location.reload()"
-                        class="py-4 bg-gray-100 text-slate-500 rounded-2xl font-bold text-sm">
-                        🔄 重置
+                    <button id="btnScreen" onclick="toggleScreenCapture()"
+                        class="py-4 rounded-2xl font-bold text-sm transition-colors bg-gray-100 text-slate-600">
+                        🖥️ 屏幕捕获
                     </button>
                 </div>
+
+                <button onclick="location.reload()"
+                    class="w-full py-2 mb-6 bg-gray-100 text-slate-500 rounded-2xl font-bold text-xs">
+                    🔄 重置
+                </button>
 
                 <!-- 接收状态 -->
                 <div id="recvStatus" class="hidden space-y-4">
@@ -275,6 +402,35 @@
                             <div id="progressFill" class="progress-fill" style="width: 0%"></div>
                         </div>
                         <p id="decodeInfo" class="text-[10px] text-emerald-600 mt-2 font-mono">初始化中...</p>
+                    </div>
+
+                    <!-- 接收诊断：用来判断「卡在 1%」到底是采不到、还是解不出来 -->
+                    <div class="p-4 bg-slate-50 rounded-3xl border border-slate-200">
+                        <div class="flex justify-between items-center mb-2">
+                            <span class="text-xs font-black text-slate-500 uppercase">接收诊断</span>
+                            <span id="recvDecodeRate" class="text-xs font-mono font-bold text-slate-500">—</span>
+                        </div>
+                        <div class="grid grid-cols-2 gap-y-1 text-[10px] font-mono text-slate-500">
+                            <span>采集画面</span><span id="recvVideoSize" class="text-right">—</span>
+                            <span>采集/派发帧率</span><span id="recvCaptureFps" class="text-right">—</span>
+                            <span>已处理帧</span><span id="recvProcessed" class="text-right">0</span>
+                            <span>成功解码帧</span><span id="recvDecoded" class="text-right">0</span>
+                            <span>无码 / 对齐失败</span><span id="recvFailed" class="text-right">0</span>
+                            <span>数据流进度</span><span id="recvStreams" class="text-right">—</span>
+                        </div>
+                        <p id="recvDiagHint" class="text-[10px] text-slate-400 mt-2 leading-relaxed"></p>
+                    </div>
+
+                    <!-- 文本接收区：收到文本时直接显示，不产生下载文件 -->
+                    <div id="recvTextBox" class="hidden p-5 bg-amber-50 rounded-3xl border border-amber-100">
+                        <div class="flex justify-between items-center mb-3">
+                            <span class="text-xs font-black text-amber-600 uppercase">📝 接收到的文本</span>
+                            <button id="btnCopyText" onclick="copyReceivedText()"
+                                class="px-3 py-1 bg-amber-200 text-amber-800 rounded-full text-xs font-bold">📋 复制文本</button>
+                        </div>
+                        <p id="recvTextMeta" class="text-[10px] text-amber-600 mb-2 font-mono"></p>
+                        <textarea id="recvText" readonly rows="8"
+                            class="w-full p-3 bg-white border border-amber-200 rounded-2xl text-sm font-mono resize-y"></textarea>
                     </div>
                 </div>
             </div>
@@ -298,11 +454,46 @@
     <script src="cimbar-deps/vconsole.min.js"></script>
     <!-- 引入 Cimbar WASM 模块 -->
     <script>
-        // 必须在 cimbar_js.js 加载之前定义 Module
+        // 必须在 cimbar_js.js 加载之前定义 Module。
+        //
+        // 重要：Emscripten 的导出函数（Module._cimbare_configure 等）是「自毁式包装函数」，
+        // 在脚本解析阶段就已经存在，形如：
+        //     var _cimbare_configure = Module["_cimbare_configure"] = (a0,a1) =>
+        //         (_cimbare_configure = Module["_cimbare_configure"] = wasmExports["za"])(a0,a1);
+        // 在 WASM 实例化完成前，wasmExports 还是个空对象 {}，此时调用会把两边都赋成 undefined
+        // 再调用它，抛 "TypeError: _cimbare_configure is not a function"，
+        // 并且包装函数被永久破坏（刷新前再也用不了）。
+        // 所以「typeof 是不是 function」永远为真，绝不能用来判断 WASM 是否就绪。
+        // 唯一可靠的就绪信号是 Module.onRuntimeInitialized / Module.calledRun。
         var Module = {};
-        Module.onRuntimeInitialized = () => {
-            console.log('Cimbar WASM 模块已初始化');
+        window.__cimbarWasmReady = false;
+        window.__cimbarWasmFailed = false;
+
+        Module.onRuntimeInitialized = function () {
+            window.__cimbarWasmReady = true;
+            console.log('✅ Cimbar WASM 模块已初始化 (calledRun=' + Module.calledRun + ')');
+            if (typeof updateStartButtonState === 'function') updateStartButtonState();
         };
+
+        // WASM 加载 / 实例化失败时给出明确提示，而不是永远停在「载入中」
+        Module.onAbort = function (what) {
+            window.__cimbarWasmReady = false;
+            window.__cimbarWasmFailed = true;
+            console.error('❌ Cimbar WASM 中止:', what);
+            if (typeof onWasmLoadFailure === 'function') onWasmLoadFailure(what);
+        };
+
+        // ── file://（直接双击打开本地文件）支持 ─────────────────────────────
+        // Chrome 禁止 file:// 页面用 XHR / fetch 读取本地 .wasm，Emscripten 会抛
+        // "both async and sync fetching of the wasm failed"，导致「WASM 引擎加载失败」。
+        // 但 <script src="本地文件"> 在 file:// 下是允许的，
+        // 所以这里条件注入一个把 wasm 以 base64 内嵌的脚本：它会在胶水脚本执行前
+        // 把二进制塞进 Module.wasmBinary，Emscripten 随即走 getBinarySync()
+        // 纯内存实例化，完全不碰网络栈。
+        // HTTP/HTTPS 部署不会加载这个 2.5MB 的文件，仍走原来的流式编译路径。
+        if (location.protocol === 'file:') {
+            document.write('<script src="cimbar-deps/cimbar_wasm_b64.2026-01-20T0312.js"><\/script>');
+        }
     </script>
     <script src="cimbar-deps/cimbar_js.2026-01-20T0312.js"></script>
     <script src="cimbar-deps/zstd.2026-01-20T0312.js"></script>
@@ -312,27 +503,60 @@
 
     <script>
         // ==================== 全局状态 ====================
+
+        // 文本传输的载荷以这个前缀命名；接收端据此判断「这是文本」而不是文件。
+        // 前缀刻意保持纯 ASCII，避免任何编码歧义。
+        const TEXT_PAYLOAD_PREFIX = 'airscan-text-';
+        const TEXT_PAYLOAD_RE = /^airscan-text-\d+\.txt$/i;
+
         let sendState = {
-            file: null,
+            file: null,          // 待发送载荷（File 或 Blob）
             fileName: '',
             fileSize: 0,
+            inputKind: 'file',   // 'file' | 'text'
             mode: 'B',
             fps: 15,
+            actualFps: 0,        // 实测帧率
+            idealRatio: 1,       // 当前编码模式给出的宽高比（宽/高）
+            bigView: false,      // 是否处于「大画面」铺满模式
+            canvasAligned: false, // drawing buffer 是否已对齐渲染器的固定 viewport
             isEncoding: false,
-            animationId: null
+            animationId: null,
+            wasmFailed: false
         };
 
         let recvState = {
-            cameraActive: false,
-            videoStream: null,
+            active: false,       // 是否正在接收
+            source: null,        // 接收来源：'camera' 摄像头 | 'screen' 屏幕捕获
+            stream: null,        // 当前视频流（用于停止）
             workers: [],
             decodeBuffer: null,
             fileId: null,
             fileName: '',
             progress: 0,
             startTime: null, // 解码开始时间
-            timerInterval: null // 计时器间隔ID
+            timerInterval: null, // 计时器间隔ID
+            finishing: false,    // 是否已收齐数据、正在组装
+            isText: false,       // 本次接收是否为文本载荷
+            receivedText: null,  // 接收到的文本内容
+            statTimer: null,     // 诊断刷新定时器
+            pumpSeq: 0,          // 帧泵代号（自增即可让旧循环退出）
+            inFlight: 0,         // 已派发但未回收的帧数（背压用）
+            decodeMode: 0,       // 自动探测锁定的编码模式
+            lastFrameSize: '',   // 最近一帧的像素尺寸
+            stats: {             // 接收诊断计数
+                dispatched: 0,   // 送进 Worker 的帧数
+                processed: 0,    // Worker 回传结果的帧数
+                ok: 0,           // 成功提取出数据的帧数
+                nodata: 0,       // 画面里没找到码
+                failed: 0,       // 找到码但提取/对齐失败
+                other: 0,
+                ready: 0
+            }
         };
+
+        // 接收端的函数劫持只做一次（重复包装会导致进度重复计算 / 重复下载）
+        let receiverPrepared = false;
 
         // ==================== 标签切换 ====================
         function switchTab(tab) {
@@ -380,22 +604,40 @@
         }
 
         // 安全获取 Emscripten 导出的 WASM 函数
+        //
+        // 注意：这些导出函数是「自毁式包装函数」，脚本解析后即存在。
+        // 因此拿到非 null 只能说明「名字存在」，不能说明 WASM 已实例化 ——
+        // 调用前必须先用 isWasmReady() 确认，否则会把包装函数永久打成 undefined。
         function getWasmFn(fnName) {
             if (typeof Module === 'undefined') return null;
             const altName = fnName.startsWith('_') ? fnName.substring(1) : '_' + fnName;
             if (typeof Module[fnName] === 'function') return Module[fnName].bind(Module);
             if (typeof Module[altName] === 'function') return Module[altName].bind(Module);
-            if (Module.asm && typeof Module.asm[fnName] === 'function') return Module.asm[fnName].bind(Module.asm);
-            if (Module.asm && typeof Module.asm[altName] === 'function') return Module.asm[altName].bind(Module.asm);
-            if (Module.wasmExports && typeof Module.wasmExports[fnName] === 'function') return Module.wasmExports[fnName].bind(Module.wasmExports);
             return null;
         }
 
-        // WASM 模块准备就绪判定（必须多核心 API 同时有效）
+        // WASM 是否真的可以调用：
+        //   Module.calledRun 由 Emscripten 在 __wasm_call_ctors 跑完后置为 1
+        //   Module.HEAPU8 只在 wasm 实例化成功（receiveInstance → updateMemoryViews）后才存在
         function isWasmReady() {
-            return getWasmFn('_cimbare_configure') !== null && 
-                   getWasmFn('_cimbare_init_encode') !== null && 
+            if (typeof Module === 'undefined') return false;
+            if (!Module.calledRun) return false;
+            if (!Module.HEAPU8 || !Module.HEAPU8.buffer) return false;
+            return getWasmFn('_cimbare_configure') !== null &&
+                   getWasmFn('_cimbare_init_encode') !== null &&
                    getWasmFn('_malloc') !== null;
+        }
+
+        // WASM 加载失败时的统一处理
+        function onWasmLoadFailure(what) {
+            sendState.wasmFailed = true;
+            updateStartButtonState();
+            const isFile = (location.protocol === 'file:');
+            alert('WASM 引擎加载失败：' + what + '\n\n' + (isFile
+                ? 'file:// 模式下需要 cimbar-deps/cimbar_wasm_b64.2026-01-20T0312.js'
+                  + '（wasm 的内嵌 base64 副本）。请确认它与 cimbar-deps 目录一起被完整复制过来，然后刷新页面。'
+                : '请确认 cimbar-deps/cimbar_js.2026-01-20T0312.wasm 能正常访问（HTTP 200、'
+                  + 'Content-Type: application/wasm），然后刷新页面重试。'));
         }
 
         // 统一更新按钮状态
@@ -403,28 +645,97 @@
             const btn = document.getElementById('btnStart');
             if (!btn) return;
 
+            // 1) WASM 状态优先：未就绪 / 失败时都不允许点击
+            if (!isWasmReady()) {
+                btn.disabled = true;
+                btn.classList.add('bg-gray-300');
+                btn.classList.remove('bg-blue-600', 'shadow-xl', 'active:scale-95');
+                btn.textContent = (sendState.wasmFailed || window.__cimbarWasmFailed)
+                    ? '❌ WASM 引擎加载失败，请刷新重试'
+                    : '⏳ WASM 引擎载入中...';
+                return;
+            }
+
+            // 2) 还没有待发送内容
             if (!sendState.file) {
                 btn.disabled = true;
                 btn.classList.add('bg-gray-300');
                 btn.classList.remove('bg-blue-600', 'shadow-xl', 'active:scale-95');
-                btn.textContent = '🚀 选择文件后开始';
+                btn.textContent = sendState.inputKind === 'text'
+                    ? '🚀 请输入文本后开始'
+                    : '🚀 选择文件后开始';
                 return;
             }
 
-            if (isWasmReady()) {
-                btn.disabled = false;
-                btn.classList.remove('bg-gray-300');
-                btn.classList.add('bg-blue-600', 'shadow-xl', 'active:scale-95');
-                btn.textContent = '🚀 开始编码传输';
+            // 3) 一切就绪
+            btn.disabled = false;
+            btn.classList.remove('bg-gray-300');
+            btn.classList.add('bg-blue-600', 'shadow-xl', 'active:scale-95');
+            btn.textContent = '🚀 开始编码传输';
+        }
+
+        // ==================== 输入类型：文件 / 文本 ====================
+
+        function setInputKind(kind) {
+            sendState.inputKind = kind;
+            const isFile = (kind === 'file');
+
+            document.getElementById('fileBlock').classList.toggle('hidden', !isFile);
+            document.getElementById('textBlock').classList.toggle('hidden', isFile);
+
+            document.getElementById('kind-file').className = isFile
+                ? 'px-4 py-1.5 rounded-xl bg-white shadow-sm text-blue-600 transition-all'
+                : 'px-4 py-1.5 rounded-xl text-slate-500 transition-all';
+            document.getElementById('kind-text').className = isFile
+                ? 'px-4 py-1.5 rounded-xl text-slate-500 transition-all'
+                : 'px-4 py-1.5 rounded-xl bg-white shadow-sm text-blue-600 transition-all';
+
+            if (isFile) {
+                // 切回文件模式：丢弃文本载荷，等待用户重新选文件
+                clearFile(true);
+                updateStartButtonState();
             } else {
-                btn.disabled = true;
-                btn.classList.add('bg-gray-300');
-                btn.classList.remove('bg-blue-600', 'shadow-xl', 'active:scale-95');
-                btn.textContent = '⏳ WASM 引擎载入中...';
+                // 切到文本模式：丢弃已选文件，改为同步文本框内容
+                clearFile(true);
+                syncTextPayload();
             }
         }
 
-        function clearFile() {
+        // 把文本框内容变成待发送载荷（UTF-8 字节，中文 / emoji / 多行安全）
+        function syncTextPayload() {
+            const input = document.getElementById('textInput');
+            const text = input ? input.value : '';
+            const bytes = new TextEncoder().encode(text);
+
+            const stats = document.getElementById('textStats');
+            if (stats) stats.textContent = `${text.length} 字符 / ${bytes.length} 字节`;
+
+            if (bytes.length === 0) {
+                sendState.file = null;
+                sendState.fileName = '';
+                sendState.fileSize = 0;
+            } else {
+                // 用 Blob 承载原始 UTF-8 字节；文件名带上文本标记，
+                // 接收端据此在页面文本框里直接显示，而不是生成一个要下载的文件。
+                sendState.file = new Blob([bytes], { type: 'text/plain;charset=utf-8' });
+                sendState.fileName = TEXT_PAYLOAD_PREFIX + Date.now() + '.txt';
+                sendState.fileSize = bytes.length;
+            }
+            updateStartButtonState();
+        }
+
+        function onTextInput() {
+            syncTextPayload();
+        }
+
+        function clearText() {
+            const input = document.getElementById('textInput');
+            if (input) input.value = '';
+            syncTextPayload();
+        }
+
+        // silent=true 时只清理状态，不刷新按钮（由调用方负责）
+        function clearFile(silent) {
             sendState.file = null;
             sendState.fileName = '';
             sendState.fileSize = 0;
@@ -433,11 +744,18 @@
             document.getElementById('dropZone').classList.remove('hidden');
             document.getElementById('fileInput').value = '';
 
-            const btn = document.getElementById('btnStart');
-            btn.disabled = true;
-            btn.classList.add('bg-gray-300');
-            btn.classList.remove('bg-blue-600', 'shadow-xl', 'active:scale-95');
-            btn.textContent = '🚀 选择文件后开始';
+            if (!silent) updateStartButtonState();
+        }
+
+        // 读取 Blob/File 分片（兼容不支持 Blob.arrayBuffer 的旧 Safari）
+        function readBlobAsArrayBuffer(blob) {
+            if (typeof blob.arrayBuffer === 'function') return blob.arrayBuffer();
+            return new Promise((resolve, reject) => {
+                const fr = new FileReader();
+                fr.onload = () => resolve(fr.result);
+                fr.onerror = () => reject(fr.error || new Error('读取分片失败'));
+                fr.readAsArrayBuffer(blob);
+            });
         }
 
         function formatFileSize(bytes) {
@@ -455,18 +773,158 @@
             btn.classList.add('active');
         }
 
-        // FPS 更新
+        // ==================== 帧率 / 画面尺寸 ====================
+
+        // FPS 更新：三处输入（滑块 / 普通数字框 / 大画面里的数字框）双向同步，支持小数
         function updateFPS(value) {
-            sendState.fps = parseInt(value);
-            document.getElementById('fpsDisplay').textContent = value + ' FPS';
+            let v = parseFloat(value);
+            if (!isFinite(v)) return;
+            v = Math.min(30, Math.max(1, v));
+            sendState.fps = v;
+
+            const els = ['fpsRange', 'fpsNumber', 'fpsNumberBig'];
+            els.forEach(id => {
+                const el = document.getElementById(id);
+                if (el && parseFloat(el.value) !== v) el.value = v;
+            });
+
+            console.log('帧率设为 ' + v + ' FPS');
         }
+
+        // Cimbar 渲染器用的是「固定内部 viewport」——实测每种模式一个固定值，
+        // 而且完全不跟随 canvas 的 drawing buffer：
+        //     B / 4C → 1040×1040      Bm → 1040×736      Bu → 752×656
+        // 如果 drawing buffer 比它大，矩阵只会画在左下角，右边留一大片空白（实测确认）。
+        // 所以必须反过来：把 drawing buffer 对齐到渲染器的 viewport，
+        // 再用 CSS 把整幅画面放大到占满可用空间（浏览器缩放，这也是上游 cimbar 的做法）。
+        function getRendererViewport() {
+            const gl = Module.ctx;
+            if (!gl || !gl.getParameter) return null;
+            const v = gl.getParameter(gl.VIEWPORT);
+            if (!v || !v[2] || !v[3]) return null;
+            return { w: v[2], h: v[3] };
+        }
+
+        function layoutCimbarCanvas() {
+            const canvas = document.getElementById('cimbar-canvas');
+            if (!canvas || !sendState.isEncoding) return;
+
+            const vp = getRendererViewport();
+            const ratio = vp ? (vp.w / vp.h) : (sendState.idealRatio || 1);
+            const big = !!sendState.bigView;
+            const box = document.getElementById('encodingBox');
+
+            // 先算出「除了画布之外还要占多少高度」（状态栏 + 帧率行 + 统计 + 停止按钮），
+            // 这样大画面下能把剩下的空间全部给画布。
+            // 注意：不能用 box.scrollHeight —— 大画面下它是 position:fixed，
+            // scrollHeight 至少等于视口高度，会导致每排一次版画布就缩小一圈（正反馈）。
+            let overhead = 0;
+            if (box) {
+                for (const child of box.children) {
+                    overhead += child.getBoundingClientRect().height;
+                }
+                overhead = Math.max(overhead - (canvas.getBoundingClientRect().height || 0), 60);
+            } else {
+                overhead = 200;
+            }
+
+            let availW, availH;
+            if (big) {
+                availW = Math.max(window.innerWidth - 32, 200);
+                availH = Math.max(window.innerHeight - overhead - 20, 200);
+            } else {
+                availW = Math.max((box.clientWidth || 480) - 32, 200);
+                availH = Math.max(window.innerHeight - overhead - 120, 240);
+            }
+
+            let dispW, dispH;
+            if (availW / availH > ratio) { dispH = availH; dispW = Math.round(dispH * ratio); }
+            else { dispW = availW; dispH = Math.round(dispW / ratio); }
+
+            // drawing buffer 直接对齐渲染器 viewport —— 矩阵正好铺满，没有空白带。
+            // 还没渲染过第一帧时拿不到 viewport，先用显示尺寸占位，第一帧后会自动校准。
+            canvas.width = vp ? vp.w : dispW;
+            canvas.height = vp ? vp.h : dispH;
+            canvas.style.width = dispW + 'px';
+            canvas.style.height = dispH + 'px';
+
+            const sizeEl = document.getElementById('canvasSize');
+            if (sizeEl) {
+                sizeEl.textContent = `${dispW}×${dispH} 显示 / ${canvas.width}×${canvas.height} 渲染`
+                    + (vp ? '' : '（校准中…）');
+            }
+            console.log(`Canvas: ${canvas.width}x${canvas.height} (渲染) / ${dispW}x${dispH} (显示), ratio=${ratio.toFixed(3)}, 大画面=${big}, overhead=${Math.round(overhead)}`);
+        }
+
+        function syncBigViewButton() {
+            const btn = document.getElementById('btnFullscreen');
+            if (btn) {
+                btn.textContent = document.fullscreenElement
+                    ? '⛶ 退出全屏'
+                    : '⛶ 真全屏（再大一点）';
+            }
+        }
+
+        // 大画面模式用纯 CSS 铺满视口 —— 不依赖 Fullscreen API，任何环境都必定生效
+        function enterBigView() {
+            sendState.bigView = true;
+            const box = document.getElementById('encodingBox');
+            if (box) box.classList.add('fullbleed');
+            syncBigViewButton();
+            setTimeout(layoutCimbarCanvas, 60);
+        }
+
+        function exitBigView() {
+            sendState.bigView = false;
+            const box = document.getElementById('encodingBox');
+            if (box) box.classList.remove('fullbleed');
+            if (document.fullscreenElement) {
+                try {
+                    const r = document.exitFullscreen();
+                    if (r && r.catch) r.catch(() => { });
+                } catch (e) { }
+            }
+            syncBigViewButton();
+        }
+
+        // 按钮：在有 CSS 大画面的基础上再切一次「真全屏」（拿掉浏览器边框，多出约 90px）
+        function toggleRealFullscreen() {
+            const box = document.getElementById('encodingBox');
+            if (!document.fullscreenElement) {
+                if (box && box.requestFullscreen) {
+                    try {
+                        const r = box.requestFullscreen();
+                        if (r && r.catch) r.catch(e => alert('无法进入全屏: ' + ((e && e.message) || e)));
+                    } catch (e) {
+                        alert('无法进入全屏: ' + ((e && e.message) || e));
+                    }
+                }
+            } else {
+                try {
+                    const r = document.exitFullscreen();
+                    if (r && r.catch) r.catch(() => { });
+                } catch (e) { }
+            }
+        }
+
+        document.addEventListener('fullscreenchange', () => {
+            syncBigViewButton();
+            setTimeout(layoutCimbarCanvas, 60);
+        });
+
+        window.addEventListener('resize', () => {
+            if (sendState.isEncoding) layoutCimbarCanvas();
+        });
 
         // 开始编码
         async function startEncoding() {
             if (!sendState.file) return;
 
+            // 就绪判定必须走 isWasmReady()：导出包装函数在脚本解析期就已存在，
+            // 未实例化时调用会把它永久打成 undefined（这正是原报错
+            // "_cimbare_configure is not a function" 且刷新前再也无法恢复的原因）
             if (!isWasmReady()) {
-                alert('⏳ WebAssembly 解码引擎正在初始化加载中，请稍候 2-3 秒后再试...');
+                alert('WASM 编码引擎还在加载中，请稍候 1-3 秒后再点。');
                 updateStartButtonState();
                 return;
             }
@@ -480,13 +938,14 @@
             const wasm_free = getWasmFn('_free');
 
             if (!cimbare_configure || !cimbare_init_encode || !wasm_malloc || !wasm_free) {
-                alert('⏳ WebAssembly 编码函数尚未完全解析完成，请稍等片刻后再试...');
+                alert('WASM 编码函数未就绪，请刷新页面重试。');
                 return;
             }
 
             sendState.isEncoding = true;
             document.getElementById('encodingBox').classList.remove('hidden');
             document.getElementById('btnStart').disabled = true;
+            setEncodeProgressText('准备中…');
 
             // 初始化 Cimbar 编码器
             const canvas = document.getElementById('cimbar-canvas');
@@ -494,6 +953,7 @@
 
             if (!ctx) {
                 alert('WebGL 不可用，请检查浏览器支持');
+                abortEncoding();
                 return;
             }
 
@@ -507,264 +967,750 @@
             try {
                 cimbare_configure(modeMap[sendState.mode], -1);
 
-                // 获取宽高比并调整 Canvas 尺寸（关键步骤）
-                const idealRatio = cimbare_get_aspect_ratio ? cimbare_get_aspect_ratio() : 1.0;
+                // 宽高比由编码模式决定（实测 B=1.000 / Bm≈1.413 / Bu≈1.152 / 4C=1.000）。
+                // 必须严格按它设置 canvas：原先统一按 1040x1040 方形处理，
+                // 会把 Bm / Bu 的矩阵压缩变形 → 接收端看到的就是"糊"的、根本解不出来。
+                sendState.idealRatio = cimbare_get_aspect_ratio ? cimbare_get_aspect_ratio() : 1.0;
+                console.log('编码模式宽高比 = ' + sendState.idealRatio);
 
-                // 根据宽高比计算合适的尺寸
-                let canvasWidth = 1040;
-                let canvasHeight = Math.floor(canvasWidth / idealRatio);
-
-                if (canvasHeight > 1040) {
-                    canvasHeight = 1040;
-                    canvasWidth = Math.floor(canvasHeight * idealRatio);
-                }
-
-                canvasWidth = Math.max(canvasWidth, 1040);
-                canvasHeight = Math.max(canvasHeight, 1040);
-
-                canvas.width = canvasWidth;
-                canvas.height = canvasHeight;
-
-                const container = document.getElementById('encodingBox');
-                const containerWidth = container.clientWidth - 64 || 480;
-                const containerHeight = container.clientHeight - 240 || 460;
-
-                const displayRatio = containerWidth / containerHeight;
-                let displayWidth, displayHeight;
-                const margin = 4;
-
-                if (displayRatio > idealRatio) {
-                    displayHeight = containerHeight - margin;
-                    displayWidth = Math.floor(displayHeight * idealRatio);
-                } else {
-                    displayWidth = containerWidth - margin;
-                    displayHeight = Math.floor(displayWidth / idealRatio);
-                }
-
-                canvas.style.width = displayWidth + 'px';
-                canvas.style.height = displayHeight + 'px';
-
-                console.log(`Canvas 渲染尺寸: ${canvasWidth}x${canvasHeight}, 显示尺寸: ${displayWidth}x${displayHeight}`);
+                // 自动进入「大画面」：画面越大，接收端越容易一次看全，这是清晰度的关键
+                sendState.canvasAligned = false;   // 第一帧后按渲染器真实 viewport 再校准一次
+                enterBigView();
+                layoutCimbarCanvas();
             } catch (e) {
                 console.error('配置编码模式异常:', e);
-                alert('WebAssembly 模块准备中，请稍后重试: ' + e.message);
-                sendState.isEncoding = false;
-                document.getElementById('encodingBox').classList.add('hidden');
-                updateStartButtonState();
+                alert('编码器配置失败: ' + e.message);
+                abortEncoding();
                 return;
             }
 
-            // 初始化编码会话
-            const fileNameBytes = new TextEncoder('utf-8').encode(sendState.fileName);
-            const fileNamePtr = wasm_malloc(fileNameBytes.length);
-            const wasmFileName = new Uint8Array(Module.HEAPU8.buffer, fileNamePtr, fileNameBytes.length);
-            wasmFileName.set(fileNameBytes);
-            cimbare_init_encode(fileNamePtr, fileNameBytes.length, -1);
-            wasm_free(fileNamePtr);
-
-            // 读取文件并编码
-            const reader = new FileReader();
-
-            reader.onload = function (e) {
-                const data = new Uint8Array(e.target.result);
-                const wasmPtr = wasm_malloc(data.length);
-                const wasmData = new Uint8Array(Module.HEAPU8.buffer, wasmPtr, data.length);
-                wasmData.set(data);
-
-                cimbare_encode(wasmPtr, data.length);
-                wasm_free(wasmPtr);
-
-                // 开始渲染循环
-                startRenderLoop();
-            };
-
-            reader.readAsArrayBuffer(sendState.file);
-        }
-
-        // 渲染循环
-        function startRenderLoop() {
-            const canvas = document.getElementById('cimbar-canvas');
-            let frameCount = 0;
-            const interval = 1000 / sendState.fps;
-            let lastTime = 0;
-
-            function render(currentTime) {
-                if (!sendState.isEncoding) return;
-
-                if (currentTime - lastTime >= interval) {
-                    Module._cimbare_render();
-                    Module._cimbare_next_frame(false);
-
-                    frameCount++;
-                    document.getElementById('frameCounter').textContent = frameCount;
-
-                    lastTime = currentTime;
-                }
-
-                sendState.animationId = requestAnimationFrame(render);
+            // 初始化编码会话：文件名以 UTF-8 字节传给 WASM，中文 / emoji 文件名安全
+            try {
+                const fileNameBytes = new TextEncoder().encode(sendState.fileName);
+                const fileNamePtr = wasm_malloc(Math.max(fileNameBytes.length, 1));
+                new Uint8Array(Module.HEAPU8.buffer, fileNamePtr, fileNameBytes.length).set(fileNameBytes);
+                const initRes = cimbare_init_encode(fileNamePtr, fileNameBytes.length, -1);
+                console.log('cimbare_init_encode 返回 ' + initRes);
+                wasm_free(fileNamePtr);
+            } catch (e) {
+                console.error('初始化编码会话失败:', e);
+                alert('初始化编码会话失败: ' + e.message);
+                abortEncoding();
+                return;
             }
 
-            render(0);
+            // 分块喂给编码器：
+            //   cimbare_encode 单次可接受的字节数上限由 cimbare_encode_bufsize() 决定。
+            //   原实现把整个文件一次性丢进去（超过上限会越界/截断），且漏掉了收尾的 flush 调用。
+            //   这里按上游 main.js 的做法：按 bufsize 分块 + 末尾一次 0 长度 flush。
+            const chunkSize = (cimbare_encode_bufsize ? cimbare_encode_bufsize() : 0) || (512 * 1024);
+            let encodePtr = 0;
+
+            try {
+                encodePtr = wasm_malloc(chunkSize);
+                if (!encodePtr) throw new Error('WASM 内存分配失败（文件是否过大？）');
+
+                const total = sendState.file.size;
+                let offset = 0;
+
+                while (offset < total) {
+                    const slice = sendState.file.slice(offset, offset + chunkSize);
+                    const ab = await readBlobAsArrayBuffer(slice);
+                    if (!ab.byteLength) break;
+
+                    // 每次都重新取 HEAPU8 视图：wasm 内存增长会让旧 ArrayBuffer 失效
+                    new Uint8Array(Module.HEAPU8.buffer, encodePtr, ab.byteLength).set(new Uint8Array(ab));
+
+                    const res = cimbare_encode(encodePtr, ab.byteLength);
+                    if (res !== 0) console.warn('cimbare_encode 返回 ' + res);
+
+                    offset += ab.byteLength;
+                    setEncodeProgress(offset, total);
+
+                    // 让出主线程，保持界面响应（也保证用户能点「停止传输」）
+                    await new Promise(resolve => setTimeout(resolve, 0));
+                    if (!sendState.isEncoding) {
+                        wasm_free(encodePtr);
+                        return;
+                    }
+                }
+
+                // flush：上游用一次 0 长度调用收尾，确保缓冲区尾部的数据进入码流
+                cimbare_encode(encodePtr, 0);
+                wasm_free(encodePtr);
+                encodePtr = 0;
+                setEncodeProgressText('编码完成，开始广播');
+            } catch (e) {
+                console.error('编码失败:', e);
+                if (encodePtr) { try { wasm_free(encodePtr); } catch (_) { } }
+                alert('编码失败: ' + e.message);
+                abortEncoding();
+                return;
+            }
+
+            // 开始渲染循环
+            startRenderLoop();
+        }
+
+        // 渲染循环：用 setTimeout 驱动（与上游 cimbar 的 Main.nextFrame 做法一致）。
+        // 不用 requestAnimationFrame —— 远程桌面 / 低刷新率环境下 rAF 会被节流，
+        // 导致设定 15 FPS 实际只跑出几帧。
+        function startRenderLoop() {
+            let frameCount = 0;
+            let lastFrameTime = performance.now();
+            let winStart = lastFrameTime;
+            let winFrames = 0;
+            let lastCost = 0;
+
+            const frameEl = document.getElementById('frameCounter');
+            const actualEl = document.getElementById('fpsActual');
+            const costEl = document.getElementById('renderCost');
+
+            function tick() {
+                if (!sendState.isEncoding) return;
+
+                const now = performance.now();
+                const interval = 1000 / sendState.fps;
+
+                if (now - lastFrameTime >= interval - 1) {
+                    const t0 = performance.now();
+                    Module._cimbare_render();
+                    Module._cimbare_next_frame(false);
+                    lastCost = performance.now() - t0;
+
+                    frameCount++;
+                    winFrames++;
+                    lastFrameTime = now;
+                    if (frameEl) frameEl.textContent = frameCount;
+
+                    // 第一帧渲染后，渲染器已经建立了自己的固定 viewport —— 按它校准画布
+                    if (!sendState.canvasAligned) {
+                        sendState.canvasAligned = true;
+                        layoutCimbarCanvas();
+                    }
+                }
+
+                // 每秒刷新一次「实测帧率」，让用户能看出显示器 / 远程桌面是否跟得上
+                if (now - winStart >= 1000) {
+                    const actual = winFrames * 1000 / (now - winStart);
+                    sendState.actualFps = actual;
+                    const txt = actual.toFixed(1) + ' FPS';
+                    const bad = actual < sendState.fps * 0.9;
+                    if (actualEl) {
+                        actualEl.textContent = txt;
+                        actualEl.className = 'font-mono font-bold ' + (bad ? 'text-red-500' : 'text-emerald-600');
+                    }
+                    const bigEl = document.getElementById('fpsActualBig');
+                    if (bigEl) {
+                        bigEl.textContent = txt + (bad ? ' ⚠' : '');
+                        bigEl.className = bad ? 'text-amber-300' : 'text-emerald-300';
+                    }
+                    if (costEl) costEl.textContent = lastCost.toFixed(1) + ' ms/帧';
+                    winStart = now;
+                    winFrames = 0;
+                }
+
+                const wait = Math.max(0, Math.round(interval - (performance.now() - lastFrameTime)));
+                sendState.animationId = setTimeout(tick, wait);
+            }
+
+            tick();
+        }
+
+        // 编码进度显示
+        function setEncodeProgressText(text) {
+            const el = document.getElementById('encodeProgress');
+            if (el) el.textContent = text;
+        }
+
+        function setEncodeProgress(done, total) {
+            if (!total) return;
+            setEncodeProgressText(Math.round(done / total * 100) + '%  (' + formatFileSize(done) + ' / ' + formatFileSize(total) + ')');
+        }
+
+        // 编码流程的统一收尾：复位状态 + 隐藏编码区 + 按真实就绪情况刷新按钮
+        function abortEncoding() {
+            sendState.isEncoding = false;
+            if (sendState.animationId) {
+                clearTimeout(sendState.animationId);
+                sendState.animationId = null;
+            }
+            document.getElementById('encodingBox').classList.add('hidden');
+            exitBigView();
+            updateStartButtonState();
         }
 
         function stopEncoding() {
             sendState.isEncoding = false;
             if (sendState.animationId) {
-                cancelAnimationFrame(sendState.animationId);
+                clearTimeout(sendState.animationId);
+                sendState.animationId = null;
             }
             document.getElementById('encodingBox').classList.add('hidden');
-            document.getElementById('btnStart').disabled = false;
+            exitBigView();
+            updateStartButtonState();
         }
 
         // ==================== 接收端逻辑 ====================
+        //
+        // 两种接收来源，走完全相同的解码流水线：
+        //   'camera'  摄像头      —— 手机/平板对着另一块屏幕扫码
+        //   'screen'  屏幕捕获    —— PC ↔ PC：直接抓窗口 / 远程桌面里的 Cimbar 色码，无需摄像头
 
-        // 摄像头控制
-        async function toggleCamera() {
-            if (recvState.cameraActive) {
-                stopCamera();
+        // 一次性准备工作（劫持 UI 钩子 + 等 Worker 里的 wasm 就绪 + 分配缓冲）
+        async function prepareReceiver() {
+            if (receiverPrepared) return;
+            receiverPrepared = true;
+
+            // 劫持 Recv.render_progress 来更新我们的 UI
+            const originalRenderProgress = Recv.render_progress;
+            Recv.render_progress = function (report) {
+                originalRenderProgress.call(Recv, report);
+
+                if (Array.isArray(report) && report.length > 0) {
+                    // 取平均进度，限制最大值为 1.0 (100%)
+                    const avgProgress = Math.min(
+                        report.reduce((sum, p) => sum + p, 0) / report.length,
+                        1.0
+                    );
+                    // 传未取整的百分比，显示精度交给 updateProgress ——
+                    // 否则 99.6% 会被显示成 100%，让人误以为已经收完了
+                    updateProgress(Math.min(avgProgress, 1) * 100);
+
+                    // 把每条数据流的真实进度也显示出来（平均值会掩盖「3 条流各自 1%」的事实）
+                    const streamsEl = document.getElementById('recvStreams');
+                    if (streamsEl) {
+                        streamsEl.textContent = report.map(p => (p * 100).toFixed(1) + '%').join(' / ');
+                    }
+
+                    // 只更新「文件名」那一行；decodeInfo 的文案交给 updateProgress 统一管理
+                    if (!recvState.finishing) {
+                        document.getElementById('recvFileName').textContent = `正在解码... (${report.length} 个数据流)`;
+                    }
+                }
+            };
+
+            // 注意：这里不劫持 Sink.reassemble_file。
+            // 原实现读取了 Sink.errBuff / Sink.errBuffSize，而这两个属性在 recv.js 中
+            // 并不存在（它们只是 Sink 内部的私有变量）。把 undefined 当指针传给
+            // _cimbard_get_filename 会被当成地址 0 写入，属于 wasm 堆内存破坏。
+            // 文件名统一在 Zstd.decompress 里获取即可（recv.js 内部自己按 UTF-8 解析文件名）。
+            if (typeof Zstd !== 'undefined') {
+                // 捕获真正的文件名
+                const originalDecompress = Zstd.decompress;
+                Zstd.decompress = function (name, id) {
+                    // ★ 只有走到这里才代表「真的解码完成」：
+                    //   recv.js 仅在 _cimbard_fountain_decode 返回 > 0 时才会调用
+                    //   Sink.reassemble_file → Zstd.decompress。此时数据已全部到手，
+                    //   可以停止采集了（这是唯一的完成信号，不要用进度百分比判断）。
+                    recvState.finishing = true;
+                    console.log('Zstd.decompress 被调用（解码完成）, name:', name, 'id:', id);
+                    stopReceive();
+
+                    // 更新 UI 显示真正的文件名
+                    document.getElementById('recvFileName').textContent = name;
+                    recvState.fileName = name;
+                    const info = document.getElementById('decodeInfo');
+                    if (info) info.textContent = '数据已收齐，正在解压 / 组装…';
+
+                    // 调用原始函数
+                    originalDecompress.call(Zstd, name, id);
+                };
+
+                // 拦截最终落盘：文本载荷直接在页面文本框里显示，不产生下载文件
+                const originalDownloadBlob = Zstd.download_blob;
+                Zstd.download_blob = function (name, blob) {
+                    if (isTextPayload(name)) {
+                        recvState.isText = true;
+                        blob.text()
+                            .then(text => showReceivedText(name, text))
+                            .catch(err => {
+                                console.error('文本解码失败，回退为文件下载:', err);
+                                recvState.isText = false;
+                                originalDownloadBlob.call(Zstd, name, blob);
+                                completeDownload(name, blob.size);
+                            });
+                        return;
+                    }
+                    recvState.isText = false;
+                    originalDownloadBlob.call(Zstd, name, blob);
+                    completeDownload(name, blob.size);
+                };
+            }
+
+            // ---- 记录自动探测锁定的编码模式（帧泵要告诉 Worker 用哪个模式解码）----
+            const origSetMode = Recv.setMode;
+            Recv.setMode = function (m) {
+                const n = (typeof m === 'string') ? parseInt(m, 10) : m;
+                if (n > 0) recvState.decodeMode = n;
+                return origSetMode.apply(Recv, arguments);
+            };
+
+            // ---- 接收诊断：把 Worker 的每一类回包都打点计数 ----
+            // 关键：recv.js 对 nodata / failed_extract 是「静默 return」的，
+            // 不打点就完全分不清「采到画面但解不出来」和「根本没采到画面」，
+            // 也就无法解释进度为什么一直停在 1%。
+            const origOnDecode = Recv.on_decode;
+            Recv.on_decode = function (wid, data) {
+                const s = recvState.stats;
+                if (data && data.ready) {
+                    s.ready++;
+                } else {
+                    s.processed++;
+                    if (data && data.nodata) s.nodata++;
+                    else if (data && data.failed_extract) s.failed++;
+                    else if (data && data.res) s.other++;
+                    else if (data && data.buff && data.buff.length) s.ok++;
+                }
+                return origOnDecode.apply(Recv, arguments);
+            };
+
+            // 等待解码 Worker 里的 WASM 就绪
+            await Recv.ww_ready;
+
+            // 初始化 Sink（收码缓冲）
+            if (typeof Sink !== 'undefined') {
+                Sink.allocate();
+            }
+
+            startRecvDiagnostics();
+        }
+
+        // 每秒刷新「接收诊断」面板，并给出可执行的结论
+        function startRecvDiagnostics() {
+            if (recvState.statTimer) return;
+            let lastOk = 0, lastDispatch = 0;
+
+            recvState.statTimer = setInterval(() => {
+                const s = recvState.stats;
+                const okRate = s.ok - lastOk;
+                const capRate = s.dispatched - lastDispatch;
+                lastOk = s.ok;
+                lastDispatch = s.dispatched;
+
+                const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+                const video = document.getElementById('video');
+
+                setTxt('recvVideoSize', recvState.lastFrameSize ||
+                    ((video && video.videoWidth) ? `${video.videoWidth}×${video.videoHeight}` : '—'));
+                setTxt('recvCaptureFps', capRate.toFixed(1) + ' fps');
+                setTxt('recvProcessed', String(s.processed));
+                setTxt('recvDecoded', String(s.ok));
+                setTxt('recvFailed', `${s.nodata} / ${s.failed}`);
+                setTxt('recvDecodeRate', okRate + ' 帧/秒');
+
+                const rateEl = document.getElementById('recvDecodeRate');
+                if (rateEl) {
+                    rateEl.className = 'text-xs font-mono font-bold ' +
+                        (okRate === 0 ? 'text-red-500' : (okRate < 3 ? 'text-amber-500' : 'text-emerald-600'));
+                }
+
+                const hint = document.getElementById('recvDiagHint');
+                if (hint) {
+                    if (!recvState.active) {
+                        hint.textContent = '未在接收。';
+                    } else if (s.processed === 0) {
+                        hint.textContent = '还没有任何帧回到解码器 —— 确认一下预览画面里看得到色码、以及捕获的是不是那个窗口。';
+                    } else if (s.ok === 0) {
+                        hint.textContent = '采到了画面，但一帧都没解出来：把发送端画面调大、发送帧率调低、或改用 B 模式。';
+                    } else if (okRate < 3) {
+                        hint.textContent = '解码速率偏低（需要几十帧/秒才实用）：发送端画面再大些、发送帧率调到与采集帧率接近、改用 B 模式，都会明显改善。';
+                    } else {
+                        hint.textContent = '解码速率正常，继续等待完成即可。';
+                    }
+                }
+            }, 1000);
+        }
+
+        // 把 video 元素接到解码流水线。
+        // ==================== 接收帧泵（关键：不依赖 <video> 是否可见）====================
+        //
+        // recv.js 的取帧路径是 init_video() + requestVideoFrameCallback()。
+        // rVFC 只在「视频元素真的被合成器绘制」时才触发：窗口被别的窗口挡住、
+        // 标签页在后台、元素不在视口内……都可能完全不触发。表现就是：
+        // 捕获明明已经开始，但一帧都没进解码器（诊断里 采集画面=—、0.0 fps、已处理帧=0）。
+        // PC 互传时发送端窗口在全屏 / 最前面，恰好会命中这个坑。
+        //
+        // 这里改用 WebCodecs 的 MediaStreamTrackProcessor 直接从视频轨道拉帧：
+        // 与元素可见性、自动播放策略都无关。<video> 仍保留，但只用于预览。
+        const SCAN_MODES = [66, 68, 67, 4];   // Bu / B / Bm / 4C（与 recv.js 的自动探测顺序一致）
+
+        let receiveWorkers = [];
+
+        function ensureReceiveWorkers(count) {
+            if (receiveWorkers.length) return receiveWorkers;
+            const ws = [];
+            for (let i = 0; i < count; i++) {
+                const w = new Worker('cimbar-deps/recv-worker.2026-01-20T0312.js');
+                w.onmessage = (ev) => {
+                    if (recvState.inFlight > 0) recvState.inFlight--;
+                    try {
+                        Recv.on_decode(i, ev.data);
+                    } catch (e) {
+                        console.error('on_decode 异常:', e);
+                    }
+                };
+                w.onerror = (err) => console.error('Worker' + i + ' error:', err);
+                ws.push(w);
+            }
+            receiveWorkers = ws;
+            console.log('接收 Worker 已创建: ' + count + ' 个');
+            return ws;
+        }
+
+        // 把一帧像素派发给下一个 Worker（复制 / 格式转换逻辑与 recv.js 的 on_frame 一致）
+        function dispatchFrame(frame, state) {
+            if (!receiveWorkers.length) return;
+            if (recvState.inFlight > 20) return;   // 背压，与 recv.js 的 _framesInFlight > 20 一致
+
+            const width = frame.displayWidth;
+            const height = frame.displayHeight;
+            recvState.lastFrameSize = width + '×' + height;
+
+            let vfparams = {};
+            if (frame.format !== 'NV12' && frame.format !== 'I420') vfparams.format = 'RGBA';
+            const size = frame.allocationSize(vfparams);
+            const buff = new Uint8Array(size);
+            frame.copyTo(buff, vfparams);
+
+            let format = vfparams.format || frame.format;
+            if (format === 'RGBA' && size !== width * height * 4) format = frame.format;
+
+            if (state.nextWorker >= receiveWorkers.length) state.nextWorker = 0;
+            const mode = recvState.decodeMode || SCAN_MODES[state.counter % SCAN_MODES.length];
+
+            recvState.stats.dispatched++;
+            recvState.inFlight++;
+            receiveWorkers[state.nextWorker].postMessage(
+                { type: 'proc', pixels: buff, format: format, width: width, height: height, mode: mode },
+                [buff.buffer]
+            );
+            state.nextWorker++;
+            try { Recv.update_visual_state(); } catch (e) { }
+        }
+
+        // 从轨道持续拉帧（与窗口是否可见无关）
+        async function pumpTrack(stream, seq) {
+            const track = stream.getVideoTracks()[0];
+            if (!track) return 'no-track';
+            if (typeof MediaStreamTrackProcessor === 'undefined') return 'no-msp';
+
+            let reader;
+            try {
+                reader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+            } catch (e) {
+                console.warn('MediaStreamTrackProcessor 创建失败:', e);
+                return 'msp-failed';
+            }
+
+            const state = { nextWorker: 0, counter: 0 };
+            console.log('帧泵已启动：直接从视频轨道取帧（不依赖窗口是否可见）');
+
+            while (recvState.active && recvState.pumpSeq === seq) {
+                let res;
+                try {
+                    res = await reader.read();
+                } catch (e) {
+                    console.warn('读帧中断:', e);
+                    break;
+                }
+                if (res.done) { console.log('视频轨道已结束'); break; }
+                const frame = res.value;
+                try {
+                    dispatchFrame(frame, state);
+                } finally {
+                    try { frame.close(); } catch (e) { }
+                }
+                state.counter++;
+            }
+
+            try { reader.releaseLock(); } catch (e) { }
+            console.log('帧泵已停止，本次共派发 ' + state.counter + ' 帧');
+            return 'ok';
+        }
+
+        // 兜底路径：MediaStreamTrackProcessor 不可用时，仍用 recv.js 的视频元素取帧。
+        // recv.js 的 init_video() 内部写死了 getUserMedia，所以临时把它换成「返回已有流」。
+        function attachStreamToRecv(video, stream) {
+            const md = navigator.mediaDevices;
+            const originalGUM = md.getUserMedia;
+            md.getUserMedia = () => Promise.resolve(stream);
+            try {
+                Recv.init_video(video);
+            } finally {
+                md.getUserMedia = originalGUM;
+            }
+        }
+
+        // 统一的接收启动流程
+        async function startReceiving(source, getStream) {
+            if (typeof Recv === 'undefined') {
+                alert('Recv 模块未加载，请刷新页面');
+                return;
+            }
+            if (typeof workersAvailable !== 'undefined' && !workersAvailable) {
+                const why = (location.protocol === 'file:')
+                    ? '\n\n当前是 file:// 打开，Chrome 默认禁止创建 Web Worker。\n请改用目录里的「启动Cimbar离线模式.bat」打开本页。'
+                    : '';
+                alert('解码 Worker 未能启动，无法接收。' + why);
+                return;
+            }
+
+            // 先取流（屏幕捕获会在这里弹出系统选择框）
+            let stream;
+            try {
+                stream = await getStream();
+            } catch (err) {
+                if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+                    console.log('用户取消了选择');
+                    return;
+                }
+                console.error('获取视频源失败:', err);
+                alert('无法获取视频源: ' + ((err && err.message) || err));
                 return;
             }
 
             try {
-                // 检查 Recv 是否可用
-                if (typeof Recv === 'undefined') {
-                    alert('Recv 模块未加载，请刷新页面');
-                    return;
-                }
+                await prepareReceiver();
 
-                // 劫持 Recv.render_progress 来更新我们的 UI
-                const originalRenderProgress = Recv.render_progress;
-                Recv.render_progress = function (report) {
-                    // 调用原始函数
-                    originalRenderProgress.call(Recv, report);
+                // 每次开始接收都复位状态，避免上一轮的文本 / 进度残留
+                recvState.finishing = false;
+                recvState.isText = false;
+                recvState.receivedText = null;
+                document.getElementById('recvTextBox').classList.add('hidden');
+                document.getElementById('progressFill').style.width = '0%';
+                document.getElementById('decodeStats').textContent = '0%';
+                const prevName = document.getElementById('recvFileName');
+                prevName.textContent = '等待数据...';
+                prevName.style.color = '';
 
-                    // 更新我们的进度条
-                    if (Array.isArray(report) && report.length > 0) {
-                        // 取平均进度，限制最大值为 1.0 (100%)
-                        const avgProgress = Math.min(
-                            report.reduce((sum, p) => sum + p, 0) / report.length,
-                            1.0
-                        );
-                        const percent = Math.round(avgProgress * 100);
-                        updateProgress(percent);
+                recvState.stream = stream;
+                recvState.source = source;
+                recvState.active = true;
 
-                        // 更新状态显示
-                        document.getElementById('decodeInfo').textContent = `已接收 ${percent}%`;
-                        document.getElementById('recvFileName').textContent = `正在解码... (${report.length} 个数据流)`;
+                // 画面比例 / 准星随来源切换
+                document.getElementById('scanOverlay').classList.toggle('screen-mode', source === 'screen');
 
-                        console.log(`进度更新: ${percent}%, 数据流数量: ${report.length}`);
-                    }
-                };
-
-                // 劫持 Sink.reassemble_file 来更新文件名和完成状态
-                const originalReassemble = Sink.reassemble_file;
-                Sink.reassemble_file = function (id) {
-                    console.log('开始组装文件, id:', id);
-
-                    // 获取文件大小
-                    const size = Module._cimbard_get_filesize(id);
-                    console.log('文件大小:', size);
-
-                    let name = id + '.' + size;
-
-                    // 尝试获取文件名
-                    const fnsize = Module._cimbard_get_filename(id, Sink.errBuff, Sink.errBuffSize);
-                    console.log('文件名长度:', fnsize);
-
-                    if (fnsize > 0) {
-                        const temparr = new Uint8Array(Module.HEAPU8.buffer, Sink.errBuff, fnsize);
-                        name = new TextDecoder('utf-8').decode(temparr);
-                        console.log('文件名:', name);
-                    }
-
-                    // 调用原始函数（会在 Zstd.decompress 中获取真正的文件名）
-                    originalReassemble.call(Sink, id);
-                };
-
-                // 劫持 Zstd.decompress 来捕获真正的文件名
-                if (typeof Zstd !== 'undefined') {
-                    const originalDecompress = Zstd.decompress;
-                    Zstd.decompress = function (name, id) {
-                        console.log('Zstd.decompress 被调用, name:', name, 'id:', id);
-
-                        // 更新 UI 显示真正的文件名
-                        document.getElementById('recvFileName').textContent = name;
-                        recvState.fileName = name;
-
-                        // 调用原始函数
-                        originalDecompress.call(Zstd, name, id);
-                    };
-                }
-
-                // 获取 video 元素
+                // 预览：<video> 只负责显示，失败也不影响解码（解码走下面的帧泵）
                 const video = document.getElementById('video');
-                // 不设置固定分辨率，让浏览器自动选择（参考 recv.html）
-
-                // 等待 WASM 模块准备好
-                await Recv.ww_ready;
-
-                // 初始化 Sink
-                if (typeof Sink !== 'undefined') {
-                    Sink.allocate();
+                try {
+                    video.srcObject = stream;
+                    const p = video.play();
+                    if (p && p.catch) p.catch(e => console.warn('预览自动播放被拒（不影响解码）:', e));
+                } catch (e) {
+                    console.warn('预览挂载失败（不影响解码）:', e);
                 }
 
-                // 初始化摄像头和视频处理
-                Recv.init_video(video);
+                // 用户在系统弹窗里点「停止共享」时同步收尾
+                const track = stream.getVideoTracks()[0];
+                if (track) {
+                    track.addEventListener('ended', () => {
+                        if (recvState.active) stopReceive();
+                    });
+                }
 
-                recvState.cameraActive = true;
-                document.getElementById('btnCamera').textContent = '⏹ 停止摄像头';
+                setRecvButtons(source);
                 document.getElementById('recvStatus').classList.remove('hidden');
-
-                // 启动解码计时器
                 startDecodeTimer();
 
+                // 启动帧泵。不 await —— 它要一直跑到用户停止；
+                // 若环境不支持 MediaStreamTrackProcessor，再回退到视频元素取帧。
+                recvState.pumpSeq++;
+                const seq = recvState.pumpSeq;
+                pumpTrack(stream, seq).then(result => {
+                    if ((result === 'no-msp' || result === 'msp-failed') &&
+                        recvState.active && recvState.pumpSeq === seq) {
+                        console.warn('回退到 <video> + requestVideoFrameCallback 取帧（' + result + '）');
+                        attachStreamToRecv(video, stream);
+                    }
+                }).catch(e => console.error('帧泵异常:', e));
             } catch (err) {
-                console.error('摄像头启动失败:', err);
-                alert('无法启动摄像头: ' + err.message);
+                console.error('接收初始化失败:', err);
+                alert('接收初始化失败: ' + ((err && err.message) || err));
+                try { stream.getTracks().forEach(t => t.stop()); } catch (e) { }
+                stopReceive();
             }
         }
 
-        function stopCamera() {
-            if (recvState.videoStream) {
-                recvState.videoStream.getTracks().forEach(track => track.stop());
-                recvState.videoStream = null;
+        // 摄像头：适合手机/平板对着另一台设备的屏幕扫码
+        async function toggleCamera() {
+            if (recvState.active && recvState.source === 'camera') { stopReceive(); return; }
+            if (recvState.active) stopReceive();
+
+            await startReceiving('camera', () => {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                    return Promise.reject(new Error('当前浏览器不支持摄像头（mediaDevices 不可用）'));
+                }
+                return navigator.mediaDevices.getUserMedia({
+                    audio: false,
+                    video: {
+                        width: { min: 720, ideal: 1920 }, // Request HD but allow flexibility
+                        height: { min: 720, ideal: 1080 },
+                        aspectRatio: matchMedia('all and (orientation:landscape)').matches ? 16 / 9 : 9 / 16,
+                        facingMode: 'environment',
+                        exposureMode: 'continuous',
+                        focusMode: 'continuous',
+                        frameRate: { ideal: 15 },
+                    }
+                });
+            });
+        }
+
+        // 屏幕捕获（PC ↔ PC）：直接抓另一个窗口 / 远程桌面里的 Cimbar 色码
+        async function toggleScreenCapture() {
+            if (recvState.active && recvState.source === 'screen') { stopReceive(); return; }
+            if (recvState.active) stopReceive();
+
+            await startReceiving('screen', () => {
+                if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+                    return Promise.reject(new Error('当前浏览器不支持屏幕捕获，请使用 Chrome 或 Edge'));
+                }
+                // 系统选择框里挑「窗口」或「整个屏幕」，让色码尽量占满画面
+                return navigator.mediaDevices.getDisplayMedia({
+                    video: { frameRate: { ideal: 15, max: 20 } },
+                    audio: false
+                });
+            });
+        }
+
+        function setRecvButtons(activeSource) {
+            const cam = document.getElementById('btnCamera');
+            const scr = document.getElementById('btnScreen');
+            if (!cam || !scr) return;
+
+            const base = 'py-4 rounded-2xl font-bold text-sm transition-colors ';
+            const on = base + 'bg-red-500 text-white shadow-lg';
+            const off = base + 'bg-gray-100 text-slate-600';
+
+            cam.className = (activeSource === 'camera') ? on : off;
+            scr.className = (activeSource === 'screen') ? on : off;
+            cam.textContent = (activeSource === 'camera') ? '⏹ 停止摄像头' : '📷 启动摄像头';
+            scr.textContent = (activeSource === 'screen') ? '⏹ 停止屏幕捕获' : '🖥️ 屏幕捕获';
+        }
+
+        // 停止当前接收来源（摄像头 / 屏幕捕获都走这里）
+        function stopReceive() {
+            if (recvState.stream) {
+                try { recvState.stream.getTracks().forEach(track => track.stop()); } catch (e) { }
+                recvState.stream = null;
             }
 
-            recvState.cameraActive = false;
-            document.getElementById('btnCamera').textContent = '📷 启动摄像头';
+            const video = document.getElementById('video');
+            if (video) {
+                try { video.pause(); } catch (e) { }
+                video.srcObject = null;
+            }
 
-            // 停止解码计时器
+            recvState.active = false;
+            recvState.source = null;
+            recvState.pumpSeq++;     // 让帧泵循环退出
+            recvState.inFlight = 0;
+
+            const overlay = document.getElementById('scanOverlay');
+            if (overlay) overlay.classList.remove('screen-mode');
+
+            setRecvButtons(null);
             stopDecodeTimer();
         }
 
-        // 更新进度
+        // 更新进度条。
+        // ⚠️ 绝对不能用进度百分比判断「收完了」并停止接收：
+        //   fountain 码的进度 = 已收到包数 / 估算所需包数，最后几个百分点往往还需要
+        //   一批包才能补齐；而 Math.round 会把 99.5% 显示成 100%。一旦在这里
+        //   stopReceive()，就会在真正完成前把采集停掉 —— 文件越大每包占比越小、
+        //   越容易踩中（实测 200KB 正常，2MB 卡死在 99.6%）。
+        //   真正的完成信号只有一个：recv.js 里 _cimbard_fountain_decode 返回 > 0
+        //   并触发 Sink.reassemble_file（用下面的 Zstd.decompress 钩子捕获）。
         function updateProgress(percent) {
             const progressFill = document.getElementById('progressFill');
             const decodeStats = document.getElementById('decodeStats');
 
             if (!progressFill || !decodeStats) return;
 
+            const shown = (percent >= 99 && percent < 100) ? percent.toFixed(1) : String(Math.round(percent));
             progressFill.style.width = percent + '%';
+            decodeStats.textContent = shown + '%';
 
-            if (percent >= 100) {
-                completeDownload();
+            const info = document.getElementById('decodeInfo');
+            if (info && !recvState.finishing) {
+                info.textContent = (percent >= 99)
+                    ? '接近完成，还差最后几个数据包，请保持画面不动…'
+                    : `已接收 ${shown}%`;
             }
         }
 
-        // 完成下载
-        function completeDownload() {
-            stopCamera();
+        // ==================== 文本载荷：判定与显示 ====================
+
+        // 发送端把「这是文本」编码进文件名（纯 ASCII 前缀，无任何编码歧义）
+        function isTextPayload(name) {
+            return typeof name === 'string' && TEXT_PAYLOAD_RE.test(name);
+        }
+
+        // 文本接收完成：直接显示在页面文本框里，不生成下载文件
+        function showReceivedText(name, text) {
+            recvState.receivedText = text;
+            recvState.isText = true;
+            stopReceive();
+
+            const box = document.getElementById('recvTextBox');
+            const ta = document.getElementById('recvText');
+            if (!box || !ta) return;
+
+            ta.value = text;
+
+            const bytes = new TextEncoder().encode(text).length;
+            document.getElementById('recvTextMeta').textContent =
+                `✅ 文本已接收 · ${text.length} 字符 · ${formatFileSize(bytes)} · 无需下载，可直接复制`;
+
+            const nameEl = document.getElementById('recvFileName');
+            nameEl.textContent = '📝 文本消息（已在下方显示）';
+            nameEl.style.color = '#10b981';
+
+            const info = document.getElementById('decodeInfo');
+            if (info) info.textContent = '文本已就绪，可直接在下方复制';
+
+            box.classList.remove('hidden');
+            box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+
+        function copyReceivedText() {
+            const ta = document.getElementById('recvText');
+            const btn = document.getElementById('btnCopyText');
+            if (!ta) return;
+
+            const done = () => {
+                if (!btn) return;
+                btn.textContent = '✅ 已复制';
+                setTimeout(() => { btn.textContent = '📋 复制文本'; }, 1500);
+            };
+
+            ta.select();
+            ta.setSelectionRange(0, ta.value.length);
+
+            if (navigator.clipboard && window.isSecureContext) {
+                navigator.clipboard.writeText(ta.value).then(done).catch(() => {
+                    try { document.execCommand('copy'); done(); } catch (e) { console.error(e); }
+                });
+            } else {
+                try { document.execCommand('copy'); done(); } catch (e) { console.error(e); }
+            }
+        }
+
+        // 文件接收完成
+        function completeDownload(name, size) {
+            stopReceive();
 
             // 显示完成提示
             const recvFileName = document.getElementById('recvFileName');
             const decodeInfo = document.getElementById('decodeInfo');
 
             if (recvFileName) {
-                recvFileName.textContent = '✅ ' + (recvState.fileName || '文件已接收');
+                recvFileName.textContent = '✅ ' + (name || recvState.fileName || '文件已接收');
                 recvFileName.style.color = '#10b981';
             }
             if (decodeInfo) {
-                decodeInfo.textContent = '文件已自动下载';
+                decodeInfo.textContent = '文件已自动下载'
+                    + (size ? `（${formatFileSize(size)}）` : '');
             }
         }
 
@@ -818,45 +1764,133 @@
 
 // ==================== 初始化 ====================
 
-        // 配置 Module.onRuntimeInitialized 回调
-        if (typeof Module === 'undefined') {
-            window.Module = {};
-        }
-        
-        Module.onRuntimeInitialized = () => {
-            console.log('✅ Cimbar WASM 模块已成功就绪！');
-            if (sendState.file) {
-                const btn = document.getElementById('btnStart');
-                btn.disabled = false;
-                btn.classList.remove('bg-gray-300');
-                btn.classList.add('bg-blue-600', 'shadow-xl', 'active:scale-95');
-                btn.textContent = '🚀 开始编码传输';
-            }
-        };
+        // 注意：Module.onRuntimeInitialized 已经在页面头部（加载 cimbar_js.js 之前）
+        // 定义过了。这里绝对不能再赋值一次 —— 否则会覆盖掉那份回调，
+        // 这正是原版「按钮永远停在载入中 / 或提前变成可点」问题的来源之一。
 
-        // 初始化 vConsole
-        const vConsole = new VConsole();
-        console.log('Cimbar 传输助手已加载，vConsole 已初始化');
+        // 初始化 vConsole（本地文件，无任何网络依赖）
+        // 用 typeof 兜底：部署时若删掉 vconsole.min.js，页面仍能正常初始化。
+        let vConsole = null;
+        try {
+            if (typeof VConsole !== 'undefined') vConsole = new VConsole();
+        } catch (e) {
+            console.warn('vConsole 初始化失败（不影响使用）:', e);
+        }
+        console.log('Cimbar 传输助手已加载' + (vConsole ? '，vConsole 已初始化' : '（未启用 vConsole）'));
+
+        // ==================== 日志降噪（对解码吞吐影响很大）====================
+        // 接收端每解一帧会产生 10+ 条调试日志（recv.js / cimbar_js.js 的输出），
+        // 而 vConsole 会为每一条往 DOM 里插一个节点 —— 几分钟就是几万条，
+        // 主线程被日志渲染拖死，采集帧率随之暴跌。
+        // 这里在 vConsole 初始化「之后」包一层过滤器（顺序很重要，否则 vConsole 仍会建 DOM），
+        // 丢掉高频噪音，并限制总输出速率。
+        (function installLogFilter() {
+            const HOT = [
+                /^\s*len is /,
+                /fountain decode res is/,
+                /^\s*on decode got res/,
+                /^\s*progress!!!!/,
+                /^\s*\[\s*0\./,
+                /^\s*\d+(\.\d+)?%$/,
+                /进度更新:/,
+                /^reader got /,
+                /^sink decode /,
+                /^resizing .* buff/,
+                /^\d+$/,                 // recv.js 里 console.log(current.length) 之类的裸数字
+            ];
+            const baseLog = console.log.bind(console);
+            let dropped = 0;
+            let forwarded = 0;
+
+            const isHot = (args) => {
+                const first = (args.length && typeof args[0] === 'string') ? args[0] : '';
+                return first !== '' && HOT.some(re => re.test(first));
+            };
+
+            console.log = function (...args) {
+                if (isHot(args) || forwarded >= 20) { dropped++; return; }
+                forwarded++;
+                baseLog(...args);
+            };
+
+            setInterval(() => {
+                if (dropped > 0) {
+                    baseLog(`…（日志降噪：已省略 ${dropped} 条高频调试输出）`);
+                    dropped = 0;
+                }
+                forwarded = 0;
+            }, 2000);
+
+            console.log('日志降噪已启用：接收过程的高频调试输出不再打印（接收诊断请看页面上的面板）');
+        })();
+
+        // main.js（上游发送端模块）的 Main.resize() 会去找 id="canvas" 的元素，
+        // 而本页用的是 #cimbar-canvas → canvas 为 null → 每次窗口 resize 都抛未捕获异常：
+        //   main.js:140 Uncaught TypeError: Cannot read properties of null (reading 'style')
+        // 本页自己管理 canvas 尺寸，完全不用 Main 的布局逻辑，直接禁掉。
+        if (typeof Main !== 'undefined') {
+            Main.resize = function () { };
+        }
 
         // 页面加载时立即初始化 Worker（参考 recv.html）
+        // 注意：Chrome 默认禁止 file:// 页面创建 Web Worker（SecurityError），
+        // 这会让「接收端」不可用；发送端不需要 Worker，不受影响。
+        // 用 --allow-file-access-from-files 启动 Chrome 即可让 Worker 正常工作。
+        let workersAvailable = false;
         if (typeof Recv !== 'undefined') {
-            Recv.init_ww(4);
-            console.log('Worker 已初始化');
+            try {
+                ensureReceiveWorkers(4);
+                workersAvailable = true;
+            } catch (e) {
+                workersAvailable = false;
+                if (location.protocol === 'file:') {
+                    console.warn('file:// 默认无法创建 Web Worker → 接收端不可用（发送端不受影响）。'
+                        + '请用目录里的「启动Cimbar离线模式.bat」打开本页。');
+                } else {
+                    console.error('Worker 初始化失败:', e);
+                }
+            }
+        }
+
+        // 运行环境提示条
+        if (location.protocol === 'file:') {
+            const warn = document.getElementById('protoWarn');
+            warn.classList.remove('hidden');
+            if (workersAvailable) {
+                warn.className = 'mb-4 p-4 bg-emerald-100 border border-emerald-300 rounded-2xl text-xs text-emerald-800 font-bold leading-relaxed';
+                warn.innerHTML = '📁 已以 <code>file://</code> + <code>--allow-file-access-from-files</code> 方式打开：'
+                    + '<b>发送端与接收端都可以正常使用</b>，摄像头也可用。';
+                console.log('file:// 模式（已放开 file 访问）：发送端 + 接收端均可用');
+            } else {
+                warn.innerHTML = '📁 已以 <code>file://</code> 本地文件方式打开。<b>发送端可以正常使用</b>'
+                    + '（wasm 已内嵌为 base64，不需要任何服务器、也不需要联网）。<br>'
+                    + '<b>接收端需要 Web Worker</b>，而 Chrome 默认禁止 file:// 页面创建 Worker。'
+                    + '解决办法：双击目录里的 <code>启动Cimbar离线模式.bat</code> 打开本页 —— '
+                    + '它用一个独立的 Chrome 实例 + <code>--allow-file-access-from-files</code> 启动，'
+                    + '接收端即可正常工作（不影响你平时的 Chrome）。';
+                console.warn('file:// 模式（默认）：发送端可用；接收端需要 --allow-file-access-from-files');
+            }
         }
 
         window.onload = () => {
             updateStartButtonState();
 
-            // 启动高频探针轮询 WASM 准备状态（持续 10 秒）
-            let checkCount = 0;
+            // 就绪探针：onRuntimeInitialized 是主信号，这里只做兜底，
+            // 避免极端情况下回调未触发导致按钮永远停在「载入中」。
+            let waitedMs = 0;
             const statusPoll = setInterval(() => {
-                checkCount++;
+                waitedMs += 250;
                 if (isWasmReady()) {
                     console.log('✅ WASM 引擎已就绪！');
+                    clearInterval(statusPoll);
                     updateStartButtonState();
+                } else if (waitedMs > 60000) {   // 60 秒仍未就绪，给出明确结论
                     clearInterval(statusPoll);
-                } else if (checkCount > 40) { // 10秒后停止探针
-                    clearInterval(statusPoll);
+                    if (!sendState.wasmFailed && !window.__cimbarWasmFailed) {
+                        sendState.wasmFailed = true;
+                        console.error('❌ 等待 WASM 就绪超时（60s）');
+                        updateStartButtonState();
+                    }
                 }
             }, 250);
         };
