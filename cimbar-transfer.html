@@ -1347,6 +1347,12 @@
                 if (hint) {
                     if (!recvState.active) {
                         hint.textContent = '未在接收。摄像头权限：' + cameraPermissionText() + '。';
+                    } else if (s.ok === 0 && s.processed > 60) {
+                        // 处理了这么多帧还一帧没解出来：基本就是「拍到的格子糊了」（屏幕像素网格的摩尔纹）
+                        hint.innerHTML = '一帧都没解出来，多半是拍到的格子糊了（摩尔纹）。<b>依次试：</b>'
+                            + '① 发送端点「⛶ 真全屏」把色码放大；'
+                            + '② 手机后退，让色码只占画面 60%~70%（别贴太近）；'
+                            + '③ 发送端编码模式换成 <b>B</b>（黑白，最不怕色偏和摩尔纹）。';
                     } else if (s.processed === 0) {
                         hint.textContent = '还没有任何帧回到解码器 —— 确认一下预览画面里看得到色码、以及捕获的是不是那个窗口。';
                     } else if (s.ok === 0) {
