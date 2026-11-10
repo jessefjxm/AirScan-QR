@@ -96,7 +96,10 @@
         .scan-video {
             width: 100%;
             height: 100%;
-            object-fit: cover;
+            /* 必须是 contain：以前用 cover，在 1:1 的框里会把 3:4 / 16:9 的画面裁掉一大截，
+               看着就像相机被放大了 1.5～1.8 倍，只能靠后退把色码塞进框里。
+               扫描器的预览应该「看到多少就采到多少」，多余的部分留黑边即可。 */
+            object-fit: contain;
         }
 
         .crosshair {
@@ -1285,8 +1288,9 @@
                 const setTxt = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
                 const video = document.getElementById('video');
 
-                setTxt('recvVideoSize', recvState.lastFrameSize ||
-                    ((video && video.videoWidth) ? `${video.videoWidth}×${video.videoHeight}` : '—'));
+                setTxt('recvVideoSize', (recvState.lastFrameSize ||
+                    ((video && video.videoWidth) ? `${video.videoWidth}×${video.videoHeight}` : '—'))
+                    + (recvState.zoomDesc || ''));
                 setTxt('recvCaptureFps', capRate.toFixed(1) + ' fps');
                 setTxt('recvProcessed', String(s.processed));
                 setTxt('recvDecoded', String(s.ok));
@@ -1500,6 +1504,49 @@
             }
         }
 
+        // 预览框的比例 = 真实画面的比例。固定 1:1 + cover 会把画面裁掉一截，
+        // 用户以为相机被放大了，只能后退找距离。
+        function fitScanOverlayToVideo(video) {
+            const overlay = document.getElementById('scanOverlay');
+            if (!overlay || !video || !video.videoWidth || !video.videoHeight) return;
+            overlay.style.aspectRatio = video.videoWidth + ' / ' + video.videoHeight;
+        }
+
+        // 把「真正拿到的画面」记下来：分辨率 / 数字变焦 / 摄像头标识。
+        // 手机上开不了 DevTools，这几行就是唯一的排障依据；另外个别机型默认带数字变焦
+        // （1x 变成 2x / 3.5x），发现 >1.05 就尝试拉回 1x。
+        async function describeVideoTrack(stream) {
+            const track = stream.getVideoTracks()[0];
+            if (!track || !track.getSettings) return;
+            let s = track.getSettings() || {};
+            const zoom0 = (typeof s.zoom === 'number') ? s.zoom : null;
+            console.log('视频轨道: ' + (s.width || '?') + '×' + (s.height || '?')
+                + ' · zoom=' + (zoom0 === null ? '（设备不支持）' : zoom0)
+                + ' · ' + (track.label || '未知设备'));
+
+            if (zoom0 !== null && zoom0 > 1.05) {
+                try {
+                    await track.applyConstraints({ zoom: 1 });
+                    s = track.getSettings() || s;
+                    console.log('检测到默认数字变焦 ' + zoom0 + 'x，已请求拉回 1x → 现在 ' + (s.zoom ?? '?') + 'x');
+                } catch (e) {
+                    console.warn('拉回 1x 失败（设备不允许设置 zoom）:', e && e.name);
+                }
+            }
+
+            const z = (typeof s.zoom === 'number' && s.zoom > 1.01) ? ' · ' + s.zoom.toFixed(1) + 'x' : '';
+            recvState.zoomDesc = z;
+
+            // 排障：把摄像头列表打出来，方便判断 Chrome 是不是挑到了长焦镜头
+            if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
+                navigator.mediaDevices.enumerateDevices().then(list => {
+                    const cams = list.filter(d => d.kind === 'videoinput')
+                        .map(d => d.label || d.deviceId.slice(0, 8));
+                    console.log('可用摄像头(' + cams.length + '): ' + cams.join(' | '));
+                }).catch(() => { });
+            }
+        }
+
         // 统一的接收启动流程
         async function startReceiving(source, getStream) {
             if (typeof Recv === 'undefined') {
@@ -1565,11 +1612,17 @@
                 const video = document.getElementById('video');
                 try {
                     video.srcObject = stream;
+                    // 画框比例跟着真实画面走，别再用固定的 1:1 去裁它
+                    if (video.readyState >= 1) fitScanOverlayToVideo(video);
+                    else video.addEventListener('loadedmetadata', () => fitScanOverlayToVideo(video), { once: true });
                     const p = video.play();
                     if (p && p.catch) p.catch(e => console.warn('预览自动播放被拒（不影响解码）:', e));
                 } catch (e) {
                     console.warn('预览挂载失败（不影响解码）:', e);
                 }
+
+                // 记下真正拿到的分辨率 / 数字变焦 / 摄像头标识（手机上没有 DevTools，这是唯一依据）
+                describeVideoTrack(stream);
 
                 // 用户在系统弹窗里点「停止共享」时同步收尾
                 const track = stream.getVideoTracks()[0];
@@ -1624,13 +1677,15 @@
                 return navigator.mediaDevices.getUserMedia({
                     audio: false,
                     video: {
-                        width: { min: 720, ideal: 1920 }, // Request HD but allow flexibility
-                        height: { min: 720, ideal: 1080 },
-                        aspectRatio: matchMedia('all and (orientation:landscape)').matches ? 16 / 9 : 9 / 16,
-                        facingMode: 'environment',
-                        exposureMode: 'continuous',
-                        focusMode: 'continuous',
+                        // 不要写 aspectRatio，也不要用 min 卡下限：
+                        // 请求 9:16 / 16:9 时，Chrome 会把 4:3 传感器的画面裁窄（约 1.3 倍），
+                        // 再叠上「1:1 预览框 + object-fit:cover」那一层裁剪，整体看起来就是 2～3 倍变焦，
+                        // 结果只能后退把色码塞进框里。这里只要「尽量高的 4:3 全画幅」，具体给多少由设备决定。
+                        facingMode: { ideal: 'environment' },
+                        width: { ideal: 1920 },
+                        height: { ideal: 1440 },
                         frameRate: { ideal: 15 },
+                        zoom: { ideal: 1 },   // 个别机型默认带数字变焦，明确要 1x（不支持时这条会被忽略）
                     }
                 });
             });
@@ -1689,7 +1744,11 @@
             recvState.inFlight = 0;
 
             const overlay = document.getElementById('scanOverlay');
-            if (overlay) overlay.classList.remove('screen-mode');
+            if (overlay) {
+                overlay.classList.remove('screen-mode');
+                // 清掉「按流比例」的内联样式，否则会盖住 .screen-mode 的 16:9
+                overlay.style.aspectRatio = '';
+            }
 
             setRecvButtons(null);
             stopDecodeTimer();
