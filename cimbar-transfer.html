@@ -218,10 +218,11 @@
 
                 <!-- 文件选择区域 -->
                 <div id="fileBlock" class="relative mb-6">
+                    <!-- 拖拽不在这里处理：deps/main.js 在 window 上挂了 dragover/drop，
+                         会把整页压成 opacity:0.5 并在 drop 里抛异常（见脚本「拖拽上传」那一段），
+                         这里只保留点击选择 -->
                     <div id="dropZone"
                         class="w-full p-8 bg-gray-50 border-2 border-dashed border-gray-200 rounded-2xl text-center cursor-pointer hover:border-blue-400 transition-colors"
-                        ondragover="event.preventDefault(); this.classList.add('border-blue-400');"
-                        ondragleave="this.classList.remove('border-blue-400');" ondrop="handleDrop(event)"
                         onclick="document.getElementById('fileInput').click()">
                         <p class="text-sm text-slate-500 mb-2">📎 拖拽文件到此处或点击选择</p>
                         <p class="text-xs text-slate-400">支持任意格式文件</p>
@@ -580,13 +581,6 @@
         // 文件处理
         function handleFileSelect(event) {
             const file = event.target.files[0];
-            if (file) processFile(file);
-        }
-
-        function handleDrop(event) {
-            event.preventDefault();
-            event.currentTarget.classList.remove('border-blue-400');
-            const file = event.dataTransfer.files[0];
             if (file) processFile(file);
         }
 
@@ -1532,12 +1526,22 @@
             }
         }
 
+        // http:// + 非 localhost 时 navigator.mediaDevices 压根不存在 —— 这是浏览器的
+        // 安全上下文规则（不是浏览器太旧）。不先说清楚，用户只会看到「不支持摄像头」。
+        function insecureContextError(feature) {
+            if (window.isSecureContext) return null;
+            return new Error('当前页面是 ' + location.protocol + '//' + location.host + '，不在安全上下文里：'
+                + '浏览器只在 https:// 或 localhost 下开放' + feature + '。请把本站改用 https 访问。');
+        }
+
         // 摄像头：适合手机/平板对着另一台设备的屏幕扫码
         async function toggleCamera() {
             if (recvState.active && recvState.source === 'camera') { stopReceive(); return; }
             if (recvState.active) stopReceive();
 
             await startReceiving('camera', () => {
+                const insecure = insecureContextError('摄像头');
+                if (insecure) return Promise.reject(insecure);
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                     return Promise.reject(new Error('当前浏览器不支持摄像头（mediaDevices 不可用）'));
                 }
@@ -1562,6 +1566,8 @@
             if (recvState.active) stopReceive();
 
             await startReceiving('screen', () => {
+                const insecure = insecureContextError('屏幕捕获');
+                if (insecure) return Promise.reject(insecure);
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
                     return Promise.reject(new Error('当前浏览器不支持屏幕捕获，请使用 Chrome 或 Edge'));
                 }
@@ -1832,6 +1838,83 @@
             Main.resize = function () { };
         }
 
+        // ==================== 拖拽上传：本页统一接管 ====================
+        //
+        // 为什么必须接管：deps/main.js 是上游 demo 的脚本，它在 window 上注册了三个拖拽处理器
+        //   dragover  → document.body.style.opacity = 0.5    ← 用户看到的「全屏变灰」
+        //   dragleave → opacity = 1.0
+        //   drop      → 先 Main.dragDrop(e)，再 opacity = 1.0
+        // 而 Main.dragDrop → importFile() → Main.setHTML('current-file', …)，
+        // 本页没有 demo 的 #current-file，于是同步抛 TypeError:
+        //   main.js:328 Cannot set properties of null (setting 'innerHTML')
+        // 后面那句 opacity = 1.0 永远执行不到 —— 文件已经进了上传框，页面却卡在灰屏。
+        // （就算不抛异常，它也会调 _cimbare_init_encode() 重置编码器，打乱正在进行的传输。）
+        //
+        // 所以在 window 的「捕获阶段」把拖拽事件全部吞掉：demo 的 window 处理器收不到任何
+        // 拖拽事件，高亮 / 复位 / 落点判断全部由本页这一处负责（单一所有者）。
+        (function setupDragUpload() {
+            const zone = document.getElementById('dropZone');
+            const block = document.getElementById('fileBlock');
+            const sendPanel = document.getElementById('panel-send');
+            if (!zone || !block || !sendPanel) return;
+
+            const HILITE = 'border-blue-400';
+
+            // 退出「拖动中」的唯一出口：drop、Esc 取消、拖出窗口、页面重新可见都走这里
+            function resetVisual() {
+                document.body.style.opacity = '';
+                zone.classList.remove(HILITE);
+            }
+            resetVisual();          // 兜底清掉历史残留
+
+            // 「发送」标签 + 「文件」模式才接管；接收页 / 文本模式不抢用户拖进来的文件
+            function dropEnabled() {
+                return !sendPanel.classList.contains('hidden') && !block.classList.contains('hidden');
+            }
+
+            // 只有「从系统拖进来的文件」才算我们的拖拽；页面内拖动文本/元素必须留给浏览器原生处理，
+            // 否则会破坏 textarea 里选中文字拖动这种操作。
+            function isFileDrag(e) {
+                const dt = e.dataTransfer;
+                return !!dt && !!dt.types && Array.prototype.indexOf.call(dt.types, 'Files') !== -1;
+            }
+
+            ['dragenter', 'dragover'].forEach(function (type) {
+                window.addEventListener(type, function (e) {
+                    // 非文件拖拽：只截断传播（别让 demo 把整页压暗），但不 preventDefault、不高亮
+                    if (!isFileDrag(e)) { e.stopPropagation(); return; }
+                    // 必须 preventDefault：否则浏览器把「拖进页面」当成导航意图，松手会直接打开文件
+                    e.preventDefault();
+                    e.stopPropagation();
+                    zone.classList.toggle(HILITE, dropEnabled() && zone.contains(e.target));
+                }, true);
+            });
+
+            window.addEventListener('dragleave', function (e) {
+                e.stopPropagation();
+                if (!isFileDrag(e)) return;
+                // 元素之间的 dragleave 会成片触发；只有 relatedTarget 为空才是真的离开窗口
+                if (!e.relatedTarget) resetVisual();
+            }, true);
+
+            window.addEventListener('drop', function (e) {
+                e.stopPropagation();
+                if (!isFileDrag(e)) return;
+                e.preventDefault();
+                const dt = e.dataTransfer;
+                const file = dt && dt.files && dt.files[0];
+                // 先复位再读文件：后面处理无论怎么失败，页面都不会留在「拖动中」
+                const accepted = dropEnabled() && !!file;
+                resetVisual();
+                if (accepted) processFile(file);
+            }, true);
+
+            // 切换标签 / 切换文件-文本模式时，别把「拖动中」的高亮带到下一个界面
+            document.addEventListener('visibilitychange', function () {
+                if (document.hidden) resetVisual();
+            });
+        })();
+
         // 页面加载时立即初始化 Worker（参考 recv.html）
         // 注意：Chrome 默认禁止 file:// 页面创建 Web Worker（SecurityError），
         // 这会让「接收端」不可用；发送端不需要 Worker，不受影响。
@@ -1870,6 +1953,15 @@
                     + '接收端即可正常工作（不影响你平时的 Chrome）。';
                 console.warn('file:// 模式（默认）：发送端可用；接收端需要 --allow-file-access-from-files');
             }
+        } else if (!window.isSecureContext) {
+            // 公网用 http://<IP>/ 打开时就是这里：发送端不受影响，接收端两个来源全被浏览器封掉
+            const warn = document.getElementById('protoWarn');
+            warn.classList.remove('hidden');
+            warn.innerHTML = '🔒 当前是 <b>http://' + location.host + '</b>，不是安全上下文：'
+                + '<b>发送端照常可用</b>，但浏览器的规则是「非 https 不给摄像头」——'
+                + '接收端的 <b>摄像头 / 屏幕捕获都会直接失败</b>（<code>navigator.mediaDevices</code> 根本不存在）。<br>'
+                + '解决办法：给本站套上 https（域名 + 证书），或用 <code>localhost</code> 打开。';
+            console.warn('非安全上下文：接收端不可用，需要 https');
         }
 
         window.onload = () => {
