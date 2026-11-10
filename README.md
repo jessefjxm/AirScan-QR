@@ -2,6 +2,12 @@
 
 **AirScan-QR** 是一款专为**物理隔离环境 (Air-gapped)** 及 **跨端受限网络** 设计的高效文件传输方案。它通过动态二维码序列流，利用“屏幕+摄像头”的视觉链路，彻底打破物理与协议的边界。
 
+> 🌐 **在线直接可用**：[https://jessefjxm.github.io/AirScan-QR/](https://jessefjxm.github.io/AirScan-QR/)
+>
+> 🚀 **高速专业版**：[https://jessefjxm.github.io/AirScan-QR/cimbar-transfer.html](https://jessefjxm.github.io/AirScan-QR/cimbar-transfer.html)
+>
+> 纯静态、零安装；页面加载完之后，收发两端**不需要任何网络连接**（数据走屏幕 → 摄像头的光链路）。
+
 ---
 
 ## 🌟 核心场景
@@ -21,7 +27,7 @@
 
 ### 方案 A：手机 ↔ 手机（移动互传）
 
-1. 两台设备均访问：[https://zxq1002.github.io/AirScan-QR/](https://zxq1002.github.io/AirScan-QR/)
+1. 两台设备均访问：[https://jessefjxm.github.io/AirScan-QR/](https://jessefjxm.github.io/AirScan-QR/)
 2. **发送方**：点击“选择文件” -> 设置帧率 -> 开始广播。
 3. **接收方**：点击“开始扫描” -> 对准发送方屏幕 -> 完成后自动触发下载。
 
@@ -124,10 +130,20 @@
 
 由于采用单 HTML 与原生客户端并行架构，你可以根据需求选择：
 
-### 1. 静态网页部署
-- **在线访问**：通过 GitHub Pages 直接使用。
-- **本地携带**：右键“另存为” `airscan-basic-embedded.html`，嵌入式单文件版本，放入 U 盘随身携带。
-- **内网分发**：直接将 HTML 文件部署在内网静态服务器或共享文件夹中。
+### 1. 静态网页部署（GitHub Pages）
+
+本仓库是**纯静态站点，没有任何构建步骤**：`main` 分支根目录就是站点根，改完 push 即生效（约 1 分钟）。
+
+- **在线地址**：[https://jessefjxm.github.io/AirScan-QR/](https://jessefjxm.github.io/AirScan-QR/)
+  - 高速专业版：[cimbar-transfer.html](https://jessefjxm.github.io/AirScan-QR/cimbar-transfer.html)
+  - ⚠️ **接收端必须跑在 https 下**（GitHub Pages 默认就是）。浏览器只在 `https://` / `localhost` / `file://` 下提供 `navigator.mediaDevices`；用 `http://<IP>` 打开时「启动摄像头 / 屏幕捕获」会直接失败，**这是浏览器规则，不是代码问题**。
+  - 页面里所有资源都是相对路径，整站放进任意子目录都能用，改目录名不用改代码。
+  - 根目录的 `.nojekyll` 是给 Pages 的：关掉 Jekyll 处理，省掉构建等待、也避免 `_` 前缀目录被忽略。
+- **本地携带**：右键“另存为” `airscan-basic-embedded.html` / `airscan-fountain-embedded.html`，单文件版本，100% 零网络依赖，放 U 盘随身携带。
+- **内网分发**：直接把 HTML 丢进内网静态服务器或共享文件夹即可。
+
+> 下面这些是**本地工具**，Pages 上只会被当普通文件托管、并不会生效，可以忽略：
+> `https_server.py`、`启动Cimbar离线模式.bat`、`cimbar-deps-start/`（本地自签证书生成脚本）。
 
 ### 2. 高速专业版部署 (Web HTTPS + WASM)
 运行本地 Python 服务：
@@ -158,11 +174,11 @@ python3 https_server.py
 
 | 分类 | 版本入口/文件名 | 核心传输原理与技术特性 | 运行与依赖环境 | 适用场景推荐与实测耗时 |
 | :--- | :--- | :--- | :--- | :--- |
-| **🟢 基础轻量版** | [airscan-basic.html](https://zxq1002.github.io/AirScan-QR/airscan-basic.html) | **标准单码循环播放版（基准版）**<br>基于 `qrious` 优化算法与顺序切片流水线，支持 1-30 FPS 动态帧率调节与单点补帧 | 纯前端 CDN / 离线 | 文本、日志、短代码段<br>⏱ **iOS 端实测**：30KB 约 50 秒 |
+| **🟢 基础轻量版** | [airscan-basic.html](https://jessefjxm.github.io/AirScan-QR/airscan-basic.html) | **标准单码循环播放版（基准版）**<br>基于 `qrious` 优化算法与顺序切片流水线，支持 1-30 FPS 动态帧率调节与单点补帧 | 纯前端 CDN / 离线 | 文本、日志、短代码段<br>⏱ **iOS 端实测**：30KB 约 50 秒 |
 | **🟢 基础轻量版** | [airscan-basic-embedded.html](airscan-basic-embedded.html) | **标准单码离线单文件版**<br>内嵌全部依赖库，100% 零网络依赖，支持无网双击直接在浏览器打开使用 | 纯前端离线单文件 | 物理隔离无网电脑、封闭实验室 |
-| **🟢 基础轻量版** | [airscan-fountain.html](https://zxq1002.github.io/AirScan-QR/airscan-fountain.html) | **喷泉码四码同传版（LT 码）**<br>2x2 四矩阵动态二维码并行广播 + 高斯消元解码，无视乱序与掉帧，解满足额 Chunk 自动还原；支持摄像头与 PC 窗口录屏扫码 | 纯前端 CDN / 离线 | 大文件/长文本、易丢帧环境<br>⏱ **iOS 端实测**：100KB 约 50 秒 |
+| **🟢 基础轻量版** | [airscan-fountain.html](https://jessefjxm.github.io/AirScan-QR/airscan-fountain.html) | **喷泉码四码同传版（LT 码）**<br>2x2 四矩阵动态二维码并行广播 + 高斯消元解码，无视乱序与掉帧，解满足额 Chunk 自动还原；支持摄像头与 PC 窗口录屏扫码 | 纯前端 CDN / 离线 | 大文件/长文本、易丢帧环境<br>⏱ **iOS 端实测**：100KB 约 50 秒 |
 | **🟢 基础轻量版** | [airscan-fountain-embedded.html](airscan-fountain-embedded.html) | **喷泉码四码同传离线单文件版**<br>内嵌全套 Qrious、html5-qrcode、jsQR 及 Tailwind 依赖，纯离线开箱即用 | 纯前端离线单文件 | 物理隔离极高可靠性文件传输 |
-| **🚀 高速专业版** | [cimbar-transfer.html](https://zxq1002.github.io/AirScan-QR/cimbar-transfer.html) | **Cimbar 4-Color 矩阵色码版**<br>采用高密度 4-Color 图标矩阵 + WebAssembly 引擎 + Zstd 高倍率压缩，详见 [README](CIMBAR-TRANSFER-README.md) | GitHub Pages 直接可用 / 本地 HTTPS Server（WASM 需安全上下文） | 1MB+ 较大文件、高吞吐要求<br>⏱ **实测**：1MB 约 32 秒（iOS 端）/ 约 40 秒（网页端） |
+| **🚀 高速专业版** | [cimbar-transfer.html](https://jessefjxm.github.io/AirScan-QR/cimbar-transfer.html) | **Cimbar 4-Color 矩阵色码版**<br>采用高密度 4-Color 图标矩阵 + WebAssembly 引擎 + Zstd 高倍率压缩，详见 [README](CIMBAR-TRANSFER-README.md) | GitHub Pages 直接可用 / 本地 HTTPS Server（WASM 需安全上下文） | 1MB+ 较大文件、高吞吐要求<br>⏱ **实测**：1MB 约 32 秒（iOS 端）/ 约 40 秒（网页端） |
 | **🚀 高速专业版** | [ios-cfc-client/](ios-cfc-client/) | **原生 iPhone (iOS) 接收端 App**<br>基于 Swift + WKWebView 复用 cimbar WASM 解码引擎，内置通用全协议解析器，支持一键保存/分享。详见 [文档](ios-cfc-client/README.md) | iOS 原生客户端 (Swift) | iPhone / iPad 手机端通用扫码接收 |
 
 ---

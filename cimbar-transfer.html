@@ -1302,7 +1302,7 @@
                 const hint = document.getElementById('recvDiagHint');
                 if (hint) {
                     if (!recvState.active) {
-                        hint.textContent = '未在接收。';
+                        hint.textContent = '未在接收。摄像头权限：' + cameraPermissionText() + '。';
                     } else if (s.processed === 0) {
                         hint.textContent = '还没有任何帧回到解码器 —— 确认一下预览画面里看得到色码、以及捕获的是不是那个窗口。';
                     } else if (s.ok === 0) {
@@ -1436,6 +1436,70 @@
             }
         }
 
+        // getUserMedia / getDisplayMedia 抛的 DOMException 名字 → 人话。
+        // NotAllowedError 在手机上是最常见的一条：不是"等不到流"，是"根本不给"。
+        const MEDIA_STREAM_ERROR_HINT = {
+            NotAllowedError: '浏览器拒绝授权（站点权限被设为「阻止」，或系统里 Chrome 的相机权限没开）',
+            PermissionDeniedError: '浏览器拒绝授权（站点权限被设为「阻止」，或系统里 Chrome 的相机权限没开）',
+            NotFoundError: '没有找到可用的摄像头',
+            DevicesNotFoundError: '没有找到可用的摄像头',
+            NotReadableError: '摄像头被其它程序占用，或系统不允许访问',
+            TrackStartError: '摄像头被其它程序占用，或系统不允许访问',
+            OverconstrainedError: '摄像头不支持请求的分辨率 / 方向参数',
+            ConstraintNotSatisfiedError: '摄像头不支持请求的分辨率 / 方向参数',
+            AbortError: '浏览器中途取消了请求（页面切到后台或被系统打断）',
+            SecurityError: '安全上下文限制：必须 https 或 localhost',
+            TypeError: '请求参数不合法',
+        };
+
+        // 同一批错误的「下一步怎么做」：不同原因的处置办法不一样，别一律让人去改权限
+        const MEDIA_STREAM_ERROR_TIP = {
+            NotAllowedError: '① 地址栏左侧图标 → 权限 → 摄像头改成「允许」，然后刷新页面；'
+                + '\n② 手机系统设置里给 Chrome 开相机权限；'
+                + '\n③ 关掉其它正在使用摄像头的 App（视频通话、扫码 App 等）。',
+            PermissionDeniedError: '① 地址栏左侧图标 → 权限 → 摄像头改成「允许」，然后刷新页面；'
+                + '\n② 手机系统设置里给 Chrome 开相机权限；'
+                + '\n③ 关掉其它正在使用摄像头的 App。',
+            NotFoundError: '这台设备没有可用摄像头（或被系统禁用）。换台设备，或改用「屏幕捕获」。',
+            DevicesNotFoundError: '这台设备没有可用摄像头（或被系统禁用）。换台设备，或改用「屏幕捕获」。',
+            NotReadableError: '关掉正在使用摄像头的其它 App（视频通话 / 相机 / 扫码）后再试。',
+            TrackStartError: '关掉正在使用摄像头的其它 App 后再试。',
+            OverconstrainedError: '换一个浏览器试；或改用「屏幕捕获」。',
+            ConstraintNotSatisfiedError: '换一个浏览器试；或改用「屏幕捕获」。',
+            AbortError: '页面可能被切到后台或被打断，回到前台再点一次。',
+            SecurityError: '用 https:// 或 localhost 打开本页。',
+        };
+
+        // 摄像头权限状态：手机上除了 vConsole 没别的地方能看，直接摆到「接收诊断」里。
+        const camPerm = { state: 'unknown' };
+
+        async function refreshCameraPermission() {
+            try {
+                if (!navigator.permissions || !navigator.permissions.query) {
+                    camPerm.state = 'unsupported';
+                    return camPerm.state;
+                }
+                const st = await navigator.permissions.query({ name: 'camera' });
+                camPerm.state = st.state;
+                st.onchange = () => { camPerm.state = st.state; };
+                console.log('摄像头权限状态: ' + st.state);
+            } catch (e) {
+                // Firefox 等不支持 query({name:'camera'})，别当成错误往外抛
+                camPerm.state = 'unsupported';
+            }
+            return camPerm.state;
+        }
+
+        function cameraPermissionText() {
+            switch (camPerm.state) {
+                case 'granted': return '已允许';
+                case 'denied': return '已拒绝 ← 需要手动改回「允许」';
+                case 'prompt': return '未决定（首次点击会弹系统询问）';
+                case 'unsupported': return '查不到（该浏览器不支持 Permissions API）';
+                default: return '未知';
+            }
+        }
+
         // 统一的接收启动流程
         async function startReceiving(source, getStream) {
             if (typeof Recv === 'undefined') {
@@ -1455,12 +1519,24 @@
             try {
                 stream = await getStream();
             } catch (err) {
-                if (err && (err.name === 'NotAllowedError' || err.name === 'AbortError')) {
+                const name = (err && err.name) || 'Error';
+                const label = source === 'camera' ? '摄像头' : '屏幕捕获';
+
+                // 屏幕捕获：用户在系统选择框里按「取消」是正常操作，只记日志，不弹窗
+                if (source === 'screen' && (name === 'NotAllowedError' || name === 'AbortError')) {
                     console.log('用户取消了选择');
                     return;
                 }
-                console.error('获取视频源失败:', err);
-                alert('无法获取视频源: ' + ((err && err.message) || err));
+
+                // 其它情况一律要说清原因。以前 NotAllowedError 也被当成「用户取消」静默 return，
+                // 手机上表现就是「点了启动摄像头没反应」，只在 vConsole 里留一行日志。
+                console.error(label + '打开失败:', name, err);
+                const hint = MEDIA_STREAM_ERROR_HINT[name] || '';
+                const tip = MEDIA_STREAM_ERROR_TIP[name] || '换一个浏览器，或用「屏幕捕获」再试一次。';
+                const detail = (err && err.message) ? '\n（' + err.message + '）' : '';
+                const perm = source === 'camera' ? '\n当前摄像头权限：' + cameraPermissionText() : '';
+                alert(label + '打开失败：' + (hint || name) + detail + '\n\n' + tip + perm);
+                refreshCameraPermission();
                 return;
             }
 
@@ -1783,6 +1859,12 @@
             console.warn('vConsole 初始化失败（不影响使用）:', e);
         }
         console.log('Cimbar 传输助手已加载' + (vConsole ? '，vConsole 已初始化' : '（未启用 vConsole）'));
+
+        // 先问一次摄像头权限：手机用户点「启动摄像头」之前就能在诊断面板看到状态
+        refreshCameraPermission();
+        // 诊断面板的刷新计时器原本要等第一次成功取流后才启动 —— 权限被拒时永远看不到，
+        // 这里提前启动（函数内部有幂等判断），让「未在接收。摄像头权限：…」一开始就显示出来
+        startRecvDiagnostics();
 
         // ==================== 日志降噪（对解码吞吐影响很大）====================
         // 接收端每解一帧会产生 10+ 条调试日志（recv.js / cimbar_js.js 的输出），
