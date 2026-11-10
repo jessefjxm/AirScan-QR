@@ -382,6 +382,16 @@
                     </button>
                 </div>
 
+                <!-- 镜头选择：Chrome 在 Android 上挑后置摄像头时可能给到长焦/微距，
+                     那种镜头在同一距离下又窄又糊，解不出码。这里让用户直接指定。 -->
+                <div id="camPickerRow" class="hidden items-center gap-2 px-1 mb-3">
+                    <span class="text-[10px] font-bold text-slate-400 shrink-0">镜头</span>
+                    <select id="camSelect" onchange="onCameraSelectChange()"
+                        class="flex-1 min-w-0 text-[11px] font-bold text-slate-600 bg-white border border-gray-200 rounded-xl px-2 py-1.5 focus:outline-none focus:border-blue-400">
+                    </select>
+                    <span class="text-[10px] text-slate-300 shrink-0">默认给错了就换一颗</span>
+                </div>
+
                 <button onclick="location.reload()"
                     class="w-full py-2 mb-6 bg-gray-100 text-slate-500 rounded-2xl font-bold text-xs">
                     🔄 重置
@@ -424,6 +434,7 @@
                         </div>
                         <p id="recvDiagHint" class="text-[10px] text-slate-400 mt-2 leading-relaxed"></p>
                     </div>
+
 
                     <!-- 文本接收区：收到文本时直接显示，不产生下载文件 -->
                     <div id="recvTextBox" class="hidden p-5 bg-amber-50 rounded-3xl border border-amber-100">
@@ -1342,10 +1353,23 @@
                 const w = new Worker('cimbar-deps/recv-worker.2026-01-20T0312.js');
                 w.onmessage = (ev) => {
                     if (recvState.inFlight > 0) recvState.inFlight--;
+                    const d = ev.data || {};
+                    // recv.js 的 on_decode 对「既不是 ready / nodata / failed_extract / res，
+                    // 也没有 buff」的消息会一路落到 buff.length 上抛 TypeError。
+                    // 典型来源是 worker 的 {type:'startWasm', error:'no wasm'}：这时不该当成解码结果。
+                    if (!d.ready && !d.nodata && !d.failed_extract && !d.res && !d.buff) {
+                        console.warn('忽略无法识别的 Worker 消息: ' + JSON.stringify(d).slice(0, 160));
+                        return;
+                    }
                     try {
                         Recv.on_decode(i, ev.data);
                     } catch (e) {
-                        console.error('on_decode 异常:', e);
+                        // 一定把 name/message/栈打出来：vConsole 里折叠的 TypeError 看不出是哪一行，
+                        // 之前只能看到「on_decode 異常: TypeError」干瞪眼。
+                        console.error('on_decode 异常: ' + (e && e.name) + ' — ' + (e && e.message)
+                            + '\n' + String((e && e.stack) || '').split('\n').slice(0, 4).join('\n')
+                            + '\n消息: ' + JSON.stringify({ ready: d.ready, res: d.res,
+                                mode: d.mode, hasBuff: !!d.buff, buffLen: (d.buff && d.buff.length) || 0 }));
                     }
                 };
                 w.onerror = (err) => console.error('Worker' + i + ' error:', err);
@@ -1537,6 +1561,13 @@
             const z = (typeof s.zoom === 'number' && s.zoom > 1.01) ? ' · ' + s.zoom.toFixed(1) + 'x' : '';
             recvState.zoomDesc = z;
 
+            // 用设备回传的真实 deviceId 校准下拉框（Chrome 未必按我们的要求给镜头）
+            if (s.deviceId) {
+                camState.currentId = s.deviceId;
+                const sel = document.getElementById('camSelect');
+                if (sel && sel.value !== s.deviceId) sel.value = s.deviceId;
+            }
+
             // 排障：把摄像头列表打出来，方便判断 Chrome 是不是挑到了长焦镜头
             if (navigator.mediaDevices && navigator.mediaDevices.enumerateDevices) {
                 navigator.mediaDevices.enumerateDevices().then(list => {
@@ -1545,6 +1576,78 @@
                     console.log('可用摄像头(' + cams.length + '): ' + cams.join(' | '));
                 }).catch(() => { });
             }
+        }
+
+        // ---- 镜头选择 ----
+        // Android 上 facingMode:'environment' 并不保证给主摄：实测有机器直接选到 camera2 4
+        // （长焦/微距），同一距离下画面又窄又糊、根本解不出码。所以能列设备就让用户选，
+        // 默认优先 camera2 0（Android 的约定：0 = 主摄）。
+        const camState = { devices: [], currentId: '' };
+
+        async function refreshCameraList() {
+            let list = [];
+            try { list = await navigator.mediaDevices.enumerateDevices(); } catch (e) { return; }
+            camState.devices = list.filter(d => d.kind === 'videoinput');
+            const row = document.getElementById('camPickerRow');
+            const sel = document.getElementById('camSelect');
+            if (!row || !sel) return;
+            if (!camState.devices.length) { row.classList.add('hidden'); return; }
+
+            // 用 DOM API 建 option，避免设备名里的引号破坏 innerHTML
+            sel.textContent = '';
+            camState.devices.forEach((d, i) => {
+                const o = document.createElement('option');
+                o.value = d.deviceId;
+                o.textContent = d.label || ('摄像头 ' + (i + 1));
+                sel.appendChild(o);
+            });
+            row.classList.remove('hidden');
+            row.classList.add('flex');
+
+            if (!camState.currentId) {
+                let stored = '';
+                try { stored = localStorage.getItem('cimbar.cameraId') || ''; } catch (e) { }
+                const pick = camState.devices.find(d => d.deviceId === stored)
+                    || camState.devices.find(d => /camera2\s*0\b/i.test(d.label))
+                    || camState.devices[0];
+                camState.currentId = pick.deviceId;
+            }
+            sel.value = camState.currentId;
+        }
+
+        function onCameraSelectChange() {
+            const sel = document.getElementById('camSelect');
+            if (!sel) return;
+            camState.currentId = sel.value;
+            try { localStorage.setItem('cimbar.cameraId', camState.currentId); } catch (e) { }
+            console.log('已选择镜头: ' + ((sel.options[sel.selectedIndex] || {}).text || camState.currentId));
+            if (recvState.active && recvState.source === 'camera') {   // 正在拍就立即换
+                stopReceive();
+                toggleCamera();
+            }
+        }
+
+        // 打开摄像头：先按用户选择取流，取完再核对 Chrome 实际给了哪颗；
+        // 不一致就换成选中的那颗（第一次点「启动摄像头」会自动纠正到主摄）。
+        async function openCamera() {
+            const base = { width: { ideal: 1920 }, height: { ideal: 1440 }, frameRate: { ideal: 15 }, zoom: { ideal: 1 } };
+            const prefer = camState.currentId
+                ? { deviceId: { exact: camState.currentId } }
+                : { facingMode: { ideal: 'environment' } };
+            let stream = await navigator.mediaDevices.getUserMedia({ audio: false, video: Object.assign({}, prefer, base) });
+
+            // 拿到权限后 label 才有内容；这一步同时决定「默认选哪颗」
+            await refreshCameraList();
+            const got = (stream.getVideoTracks()[0].getSettings() || {}).deviceId;
+            if (camState.currentId && got && got !== camState.currentId) {
+                console.log('Chrome 默认给的镜头不是选中的那颗，重新取流');
+                stream.getTracks().forEach(t => t.stop());
+                stream = await navigator.mediaDevices.getUserMedia({
+                    audio: false,
+                    video: Object.assign({ deviceId: { exact: camState.currentId } }, base)
+                });
+            }
+            return stream;
         }
 
         // 统一的接收启动流程
@@ -1674,20 +1777,7 @@
                 if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
                     return Promise.reject(new Error('当前浏览器不支持摄像头（mediaDevices 不可用）'));
                 }
-                return navigator.mediaDevices.getUserMedia({
-                    audio: false,
-                    video: {
-                        // 不要写 aspectRatio，也不要用 min 卡下限：
-                        // 请求 9:16 / 16:9 时，Chrome 会把 4:3 传感器的画面裁窄（约 1.3 倍），
-                        // 再叠上「1:1 预览框 + object-fit:cover」那一层裁剪，整体看起来就是 2～3 倍变焦，
-                        // 结果只能后退把色码塞进框里。这里只要「尽量高的 4:3 全画幅」，具体给多少由设备决定。
-                        facingMode: { ideal: 'environment' },
-                        width: { ideal: 1920 },
-                        height: { ideal: 1440 },
-                        frameRate: { ideal: 15 },
-                        zoom: { ideal: 1 },   // 个别机型默认带数字变焦，明确要 1x（不支持时这条会被忽略）
-                    }
-                });
+                return openCamera();
             });
         }
 
