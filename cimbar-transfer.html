@@ -391,6 +391,16 @@
                     </select>
                     <span class="text-[10px] text-slate-300 shrink-0">默认给错了就换一颗</span>
                 </div>
+                <!-- 变焦：色码在画面里占的像素不够时（离得远 / 屏幕小），
+                     靠镜头变焦把传感器中心区域放大，比"凑近拍"更省事。 -->
+                <div id="zoomRow" class="hidden items-center gap-2 px-1 mb-3">
+                    <span class="text-[10px] font-bold text-slate-400 shrink-0">变焦</span>
+                    <input id="zoomRange" type="range" min="1" max="4" step="0.1" value="1"
+                        oninput="onZoomInput(this.value)"
+                        class="flex-1 min-w-0 accent-blue-500">
+                    <span id="zoomLabel" class="text-[11px] font-mono font-bold text-slate-600 w-10 text-right">1.0x</span>
+                </div>
+                <p id="zoomHint" class="hidden text-[10px] text-slate-400 px-1 mb-3 leading-relaxed"></p>
 
                 <button onclick="location.reload()"
                     class="w-full py-2 mb-6 bg-gray-100 text-slate-500 rounded-2xl font-bold text-xs">
@@ -1627,6 +1637,58 @@
             }
         }
 
+        // ---- 变焦 ----
+        // 解码需要色码在画面里占足够像素。距离固定时，让镜头做「传感器中心裁剪」把码放大，
+        // 比单纯凑近更省事；设备没暴露 zoom 能力时退化成提示（这颗镜头做不了）。
+        const zoomState = { supported: false, max: 1, value: 1 };
+
+        async function setupZoom(stream) {
+            const track = stream.getVideoTracks()[0];
+            const row = document.getElementById('zoomRow');
+            const hint = document.getElementById('zoomHint');
+            const range = document.getElementById('zoomRange');
+            if (!track || !row || !range) return;
+
+            let caps = {};
+            try { caps = track.getCapabilities ? (track.getCapabilities() || {}) : {}; } catch (e) { }
+            const z = caps.zoom;
+            if (z && typeof z.max === 'number' && z.max > 1.05) {
+                zoomState.supported = true;
+                zoomState.max = Math.min(z.max, 8);
+                range.min = String(Math.max(1, Math.round((z.min || 1) * 10) / 10));
+                range.max = String(Math.round(zoomState.max * 10) / 10);
+                row.classList.remove('hidden');
+                row.classList.add('flex');
+                hint.classList.add('hidden');
+                console.log('变焦可用: ' + range.min + '–' + range.max + 'x');
+                // 重新开流后把上次的倍率再套上
+                if (zoomState.value > 1) onZoomInput(zoomState.value);
+            } else {
+                zoomState.supported = false;
+                row.classList.add('hidden');
+                hint.textContent = '这颗镜头没开放变焦能力。色码要占满预览框才容易解：把手机靠近屏幕，'
+                    + '或把发送端画面调到最大（发送端「⛶ 真全屏」）。';
+                hint.classList.remove('hidden');
+                console.log('变焦不可用（设备未暴露 zoom 能力）');
+            }
+        }
+
+        async function onZoomInput(v) {
+            const z = Math.max(1, Number(v) || 1);
+            zoomState.value = z;
+            const label = document.getElementById('zoomLabel');
+            if (label) label.textContent = z.toFixed(1) + 'x';
+            const track = recvState.stream && recvState.stream.getVideoTracks()[0];
+            if (!track || !zoomState.supported) return;
+            try {
+                await track.applyConstraints({ zoom: z });
+                const s = track.getSettings ? track.getSettings() : {};
+                console.log('变焦 → ' + z.toFixed(1) + 'x（实际 ' + (s.zoom ?? '?') + 'x）');
+            } catch (e) {
+                console.warn('设置变焦失败:', e && e.name);
+            }
+        }
+
         // 打开摄像头：先按用户选择取流，取完再核对 Chrome 实际给了哪颗；
         // 不一致就换成选中的那颗（第一次点「启动摄像头」会自动纠正到主摄）。
         async function openCamera() {
@@ -1726,6 +1788,8 @@
 
                 // 记下真正拿到的分辨率 / 数字变焦 / 摄像头标识（手机上没有 DevTools，这是唯一依据）
                 describeVideoTrack(stream);
+                // 有变焦能力就把滑杆放出来（色码像素不够时用得上）
+                setupZoom(stream);
 
                 // 用户在系统弹窗里点「停止共享」时同步收尾
                 const track = stream.getVideoTracks()[0];
