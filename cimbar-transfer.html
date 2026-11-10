@@ -392,13 +392,17 @@
                     <span class="text-[10px] text-slate-300 shrink-0">默认给错了就换一颗</span>
                 </div>
                 <!-- 变焦：色码在画面里占的像素不够时（离得远 / 屏幕小），
-                     靠镜头变焦把传感器中心区域放大，比"凑近拍"更省事。 -->
+                     靠镜头变焦把传感器中心区域放大，比"凑近拍"更省事。
+                     注意：拖动时只改数字，松手（change）才真正下发给摄像头 ——
+                     Android 上连续 applyConstraints 会 OperationError。 -->
                 <div id="zoomRow" class="hidden items-center gap-2 px-1 mb-3">
                     <span class="text-[10px] font-bold text-slate-400 shrink-0">变焦</span>
                     <input id="zoomRange" type="range" min="1" max="4" step="0.1" value="1"
-                        oninput="onZoomInput(this.value)"
+                        oninput="onZoomInput(this.value)" onchange="applyZoom(this.value)"
                         class="flex-1 min-w-0 accent-blue-500">
                     <span id="zoomLabel" class="text-[11px] font-mono font-bold text-slate-600 w-10 text-right">1.0x</span>
+                    <button onclick="applyZoom(1)"
+                        class="px-2 py-1 bg-gray-100 text-slate-500 rounded-lg text-[10px] font-bold">1x</button>
                 </div>
                 <p id="zoomHint" class="hidden text-[10px] text-slate-400 px-1 mb-3 leading-relaxed"></p>
 
@@ -432,7 +436,11 @@
                     <div class="p-4 bg-slate-50 rounded-3xl border border-slate-200">
                         <div class="flex justify-between items-center mb-2">
                             <span class="text-xs font-black text-slate-500 uppercase">接收诊断</span>
-                            <span id="recvDecodeRate" class="text-xs font-mono font-bold text-slate-500">—</span>
+                            <div class="flex items-center gap-2">
+                                <button onclick="saveLastFrame()"
+                                    class="text-[10px] font-bold text-slate-400 underline">存一帧</button>
+                                <span id="recvDecodeRate" class="text-xs font-mono font-bold text-slate-500">—</span>
+                            </div>
                         </div>
                         <div class="grid grid-cols-2 gap-y-1 text-[10px] font-mono text-slate-500">
                             <span>采集画面</span><span id="recvVideoSize" class="text-right">—</span>
@@ -568,7 +576,10 @@
             pumpSeq: 0,          // 帧泵代号（自增即可让旧循环退出）
             inFlight: 0,         // 已派发但未回收的帧数（背压用）
             decodeMode: 0,       // 自动探测锁定的编码模式
+            frameScale: 0,       // 解出数据后锁定的画面缩放（0 = 还在轮换）
             lastFrameSize: '',   // 最近一帧的像素尺寸
+            captured: null,      // 「存一帧」抓下来的像素副本
+            captureNext: false,  // 下次派发时抓一帧
             stats: {             // 接收诊断计数
                 dispatched: 0,   // 送进 Worker 的帧数
                 processed: 0,    // Worker 回传结果的帧数
@@ -1278,7 +1289,15 @@
                     if (data && data.nodata) s.nodata++;
                     else if (data && data.failed_extract) s.failed++;
                     else if (data && data.res) s.other++;
-                    else if (data && data.buff && data.buff.length) s.ok++;
+                    else if (data && data.buff && data.buff.length) {
+                        s.ok++;
+                        // 第一次解出数据就把这一档尺度锁死：之后每帧都用它，不再轮换
+                        if (!recvState.frameScale && typeof scaleByWorker[wid] === 'number') {
+                            recvState.frameScale = scaleByWorker[wid];
+                            console.log('已锁定解码尺度: ' + Math.round(recvState.frameScale * 100) + '%'
+                                + '（第 ' + wid + ' 个 worker 命中的）');
+                        }
+                    }
                 }
                 return origOnDecode.apply(Recv, arguments);
             };
@@ -1390,29 +1409,133 @@
             return ws;
         }
 
+        // ---- 存一帧：把解码器真正收到的像素导成 PNG（排查「为什么解不出」用）----
+        function saveLastFrame() {
+            if (!recvState.captured) {
+                recvState.captureNext = true;
+                alert('已排队：收到下一帧就抓下来，再点一次「存一帧」即可下载。');
+                return;
+            }
+            const cap = recvState.captured;
+            try {
+                const rgba = yuvToRgba(cap.data, cap.format, cap.width, cap.height);
+                const canvas = document.createElement('canvas');
+                canvas.width = cap.width;
+                canvas.height = cap.height;
+                canvas.getContext('2d').putImageData(new ImageData(rgba, cap.width, cap.height), 0, 0);
+                canvas.toBlob(blob => {
+                    if (!blob) { alert('导出失败：canvas 为空'); return; }
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'cimbar-frame-' + cap.width + 'x' + cap.height + '-' + cap.format + '.png';
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                    setTimeout(() => URL.revokeObjectURL(url), 5000);
+                    console.log('已导出帧: ' + a.download);
+                }, 'image/png');
+                recvState.captured = null;   // 导出一次就释放，别占内存
+            } catch (e) {
+                console.error('导出帧失败:', e);
+                alert('导出帧失败: ' + ((e && e.message) || e));
+            }
+        }
+
+        // NV12 / I420 / RGBA → RGBA（BT.601 limited range）
+        function yuvToRgba(data, format, w, h) {
+            const out = new Uint8ClampedArray(w * h * 4);
+            if (format !== 'NV12' && format !== 'I420') {
+                out.set(data.subarray(0, w * h * 4));
+                return out;
+            }
+            const n = w * h;
+            const uOff = n;
+            const vOff = (format === 'NV12') ? n + 1 : n + (n >> 2);
+            for (let y = 0; y < h; y++) {
+                for (let x = 0; x < w; x++) {
+                    const i = y * w + x;
+                    const uvIdx = (format === 'NV12')
+                        ? (y >> 1) * w + (x & ~1)
+                        : (y >> 1) * (w >> 1) + (x >> 1);
+                    const Y = data[i];
+                    const U = data[uOff + uvIdx] - 128;
+                    const V = data[vOff + uvIdx] - 128;
+                    const o = i * 4;
+                    out[o] = Y + 1.402 * V;
+                    out[o + 1] = Y - 0.344136 * U - 0.714136 * V;
+                    out[o + 2] = Y + 1.772 * U;
+                    out[o + 3] = 255;
+                }
+            }
+            return out;
+        }
+
         // 把一帧像素派发给下一个 Worker（复制 / 格式转换逻辑与 recv.js 的 on_frame 一致）
+        // cimbar 的检测器对「图像尺度」敏感得离谱：同一张真实照片，
+        // 缩到 1080/1150 宽能解出 1875 字节，1000 / 1250 / 1440 / 2880 全回 -3（对齐失败）。
+        // 所以除了轮换解码模式，再把尺度也轮换一遍；一旦某个 (尺度, 模式) 解出数据就锁定它。
+        const SCAN_SCALES = [1, 0.75, 0.5, 0.4];
+        const scaleByWorker = [];
+
         function dispatchFrame(frame, state) {
             if (!receiveWorkers.length) return;
             if (recvState.inFlight > 20) return;   // 背压，与 recv.js 的 _framesInFlight > 20 一致
 
-            const width = frame.displayWidth;
-            const height = frame.displayHeight;
-            recvState.lastFrameSize = width + '×' + height;
+            // ⚠️ 这里必须用 visibleRect，不能用 displayWidth/displayHeight。
+            // 摄像头的 VideoFrame 三者常常不一致，实测 fake/Android 上出现过：
+            //   coded  3840×2160
+            //   display 1920×1440      ← 之前误把它当成像素宽高
+            //   visible 2880×2160      ← allocationSize/copyTo 真正用的是这个
+            // 一旦拿 display 的宽高去解释 2880×2160 的缓冲区，Y 平面整行错位，
+            // 解码器只会回「对齐失败」——表现就是「偶尔成功一次、其余全灭」。
+            const rect = frame.visibleRect || { x: 0, y: 0, width: frame.codedWidth, height: frame.codedHeight };
+            const srcW = rect.width;
+            const srcH = rect.height;
+            recvState.lastFrameSize = srcW + '×' + srcH;
 
-            let vfparams = {};
-            if (frame.format !== 'NV12' && frame.format !== 'I420') vfparams.format = 'RGBA';
-            const size = frame.allocationSize(vfparams);
-            const buff = new Uint8Array(size);
-            frame.copyTo(buff, vfparams);
+            // 尺度轮换（解出过一次就锁定 recvState.frameScale）
+            const scale = recvState.frameScale || SCAN_SCALES[state.counter % SCAN_SCALES.length];
 
-            let format = vfparams.format || frame.format;
-            if (format === 'RGBA' && size !== width * height * 4) format = frame.format;
+            let width, height, format, buff;
+            if (scale < 0.999 && typeof OffscreenCanvas !== 'undefined') {
+                // 缩放路径：drawImage(VideoFrame) 会自动按 visibleRect/旋转/PAR 取正确画面
+                width = Math.max(2, Math.round(srcW * scale));
+                height = Math.max(2, Math.round(srcH * scale));
+                const oc = new OffscreenCanvas(width, height);
+                const octx = oc.getContext('2d');
+                octx.drawImage(frame, 0, 0, width, height);
+                const img = octx.getImageData(0, 0, width, height);
+                buff = img.data;
+                format = 'RGBA';
+            } else {
+                const vfparams = { rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+                if (frame.format !== 'NV12' && frame.format !== 'I420') vfparams.format = 'RGBA';
+                const size = frame.allocationSize(vfparams);
+                buff = new Uint8Array(size);
+                frame.copyTo(buff, vfparams);
+                format = vfparams.format || frame.format;
+                width = srcW;
+                height = srcH;
+                if (format === 'RGBA' && size !== width * height * 4) format = frame.format;
+                if ((format === 'I420' || format === 'NV12') && Math.abs(size - width * height * 1.5) > 8) {
+                    console.warn('帧缓冲与宽高不符: ' + format + ' ' + width + '×' + height + ' size=' + size
+                        + '（期望 ' + Math.round(width * height * 1.5) + '）—— 解码可能错位');
+                }
+            }
 
             if (state.nextWorker >= receiveWorkers.length) state.nextWorker = 0;
             const mode = recvState.decodeMode || SCAN_MODES[state.counter % SCAN_MODES.length];
 
             recvState.stats.dispatched++;
             recvState.inFlight++;
+            // 「存一帧」用它：buff 马上会被 transfer 给 worker，这里先留一份副本
+            if (recvState.captureNext) {
+                recvState.captureNext = false;
+                try { recvState.captured = { data: buff.slice(), format: format, width: width, height: height }; }
+                catch (e) { recvState.captured = null; }
+            }
+            scaleByWorker[state.nextWorker] = scale;   // 解出数据时靠它知道是哪一档尺度
             receiveWorkers[state.nextWorker].postMessage(
                 { type: 'proc', pixels: buff, format: format, width: width, height: height, mode: mode },
                 [buff.buffer]
@@ -1674,18 +1797,58 @@
         }
 
         async function onZoomInput(v) {
+            // 拖动过程中只改数字：Android 上每动一下就 applyConstraints 必然 OperationError
             const z = Math.max(1, Number(v) || 1);
-            zoomState.value = z;
             const label = document.getElementById('zoomLabel');
             if (label) label.textContent = z.toFixed(1) + 'x';
+        }
+
+        function syncZoomUi(z) {
+            const n = Number(z);
+            if (!Number.isFinite(n)) return;
+            zoomState.value = n;
+            const r = document.getElementById('zoomRange');
+            const l = document.getElementById('zoomLabel');
+            if (r) r.value = String(n);
+            if (l) l.textContent = n.toFixed(1) + 'x';
+        }
+
+        function actualZoom() {
+            const t = recvState.stream && recvState.stream.getVideoTracks()[0];
+            const s = (t && t.getSettings) ? t.getSettings() : {};
+            return (typeof s.zoom === 'number') ? s.zoom : null;
+        }
+
+        let zoomReqSeq = 0;
+        // 松手 / 点 1x 才真正下发，而且只认最后一次请求的结果
+        async function applyZoom(v) {
+            const want = Math.max(1, Number(v) || 1);
+            zoomState.value = want;
             const track = recvState.stream && recvState.stream.getVideoTracks()[0];
-            if (!track || !zoomState.supported) return;
+            if (!track || !zoomState.supported) { syncZoomUi(want); return; }
+
+            const seq = ++zoomReqSeq;
+            let target = want;
             try {
-                await track.applyConstraints({ zoom: z });
-                const s = track.getSettings ? track.getSettings() : {};
-                console.log('变焦 → ' + z.toFixed(1) + 'x（实际 ' + (s.zoom ?? '?') + 'x）');
+                const caps = (track.getCapabilities && track.getCapabilities()) || {};
+                const zc = caps.zoom || {};
+                const lo = Math.max(1, typeof zc.min === 'number' ? zc.min : 1);
+                const hi = Math.min(zoomState.max, typeof zc.max === 'number' ? zc.max : zoomState.max);
+                target = Math.min(hi, Math.max(lo, want));
+            } catch (e) { }
+
+            try {
+                await track.applyConstraints({ zoom: target });
+                if (seq !== zoomReqSeq) return;              // 期间又改了，忽略这次回读
+                const act = actualZoom();
+                syncZoomUi(act === null ? target : act);     // 以设备真实值为准，UI 不撒谎
+                console.log('变焦 → 目标 ' + target.toFixed(1) + 'x，实际 ' + (act === null ? '?' : act) + 'x');
             } catch (e) {
-                console.warn('设置变焦失败:', e && e.name);
+                // 失败就不要假装成功：把滑杆拉回设备的真实值
+                const act = actualZoom();
+                if (act !== null) syncZoomUi(act);
+                console.warn('设置变焦失败: ' + (e && e.name) + '（保持 ' + (act === null ? '未知' : act) + 'x）'
+                    + ' —— 该机型不支持中途改变焦，改用「靠近屏幕」或发送端放大画面');
             }
         }
 
