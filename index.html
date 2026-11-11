@@ -1959,9 +1959,14 @@
           var vf = null;
           try {
             vf = new VideoFrame(video, { timestamp: Math.round(performance.now() * 1000) });
-            var width = vf.displayWidth;
-            var height = vf.displayHeight;
-            var params = {};
+            // ⚠️ allocationSize()/copyTo() 量的是 visibleRect，不是 displayWidth/Height。
+            // 摄像头帧这三者可能不一致（实测：coded 3840x2160 / visible 2880x2160 / display 1920x1440），
+            // 拿 display 的宽高去解释 visible 的缓冲区，会让 Y 平面整行错位，
+            // 解码器只会回「对齐失败（-3）」——表现就是偶发能过、大部分失败。
+            var rect = vf.visibleRect || { x: 0, y: 0, width: vf.codedWidth, height: vf.codedHeight };
+            var width = rect.width;
+            var height = rect.height;
+            var params = { rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
             if (vf.format !== 'NV12' && vf.format !== 'I420') {
               params.format = 'RGBA';
             }
@@ -1971,6 +1976,9 @@
             var fmt = params.format || vf.format;
             if (fmt === 'RGBA' && size !== width * height * 4) {
               fmt = vf.format;   // 兜底
+            }
+            if ((fmt === 'I420' || fmt === 'NV12') && Math.abs(size - width * height * 1.5) > 8) {
+              console.warn('frame buffer geometry mismatch', fmt, width, height, size);
             }
             feedFrame(buff, fmt, width, height);
             return;
@@ -2135,10 +2143,16 @@
           var constraints = {
             audio: false,
             video: {
-              facingMode: facing,
-              width: { min: 720, ideal: 1920 },
-              height: { min: 720, ideal: 1080 },
-              frameRate: { ideal: 15 }
+              // 不写 aspectRatio，也不用 min 卡下限：手机传感器多是 4:3，
+              // 请求 1920x1080(16:9) 或给 min 约束时，Chrome 会裁掉画面两侧来凑比例
+              // （实测约 1.33 倍），取景范围凭空变小、色码在画面里占的像素反而更少。
+              // 这里只要「尽量大的 4:3 全画幅」，具体给多大由设备决定。
+              facingMode: { ideal: facing },
+              width: { ideal: 1920 },
+              height: { ideal: 1440 },
+              frameRate: { ideal: 15 },
+              // 个别机型默认带数字变焦（1x 实际是 2x/3.5x），明确要 1x；不支持的设备会忽略这条
+              zoom: { ideal: 1 }
             }
           };
 
