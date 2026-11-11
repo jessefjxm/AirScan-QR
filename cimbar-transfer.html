@@ -228,15 +228,20 @@
                         class="w-full p-8 bg-gray-50 border-2 border-dashed border-gray-200 rounded-2xl text-center cursor-pointer hover:border-blue-400 transition-colors"
                         onclick="document.getElementById('fileInput').click()">
                         <p class="text-sm text-slate-500 mb-2">📎 拖拽文件到此处或点击选择</p>
-                        <p class="text-xs text-slate-400">支持任意格式文件</p>
+                        <p class="text-xs text-slate-400">可多选、可多次拖入排队，最后打包成一个文件一起传</p>
                     </div>
-                    <input type="file" id="fileInput" class="hidden" onchange="handleFileSelect(event)">
+                    <input type="file" id="fileInput" class="hidden" multiple onchange="handleFileSelect(event)">
 
                     <div id="fileInfo" class="hidden mt-4 p-4 bg-blue-50 rounded-2xl border border-blue-100">
-                        <p id="fileName" class="text-sm font-bold text-blue-800 break-all mb-2"></p>
+                        <p id="fileName" class="text-sm font-bold text-blue-800 break-all mb-1"></p>
                         <p id="fileSize" class="text-xs text-blue-600"></p>
-                        <button onclick="clearFile()"
-                            class="mt-2 text-xs font-bold text-red-500 underline">清除文件</button>
+                        <ul id="fileQueue" class="mt-2 space-y-1 text-[11px] text-blue-700 max-h-32 overflow-auto"></ul>
+                        <div class="mt-2 flex gap-4">
+                            <button onclick="document.getElementById('fileInput').click()"
+                                class="text-xs font-bold text-blue-600 underline">继续添加</button>
+                            <button onclick="clearFile()"
+                                class="text-xs font-bold text-red-500 underline">清空</button>
+                        </div>
                     </div>
                 </div>
 
@@ -547,6 +552,7 @@
             fileName: '',
             fileSize: 0,
             inputKind: 'file',   // 'file' | 'text'
+            queue: [],           // 待传文件队列（多次拖入会累加，发送时打包成一个 TAR）
             mode: 'B',
             fps: 15,
             actualFps: 0,        // 实测帧率
@@ -613,23 +619,115 @@
 
         // ==================== 发送端逻辑 ====================
 
-        // 文件处理
+        // ==================== 文件队列：多选 / 多次拖入 → 打包成一个文件 ====================
+        //
+        // 一次只传一个 blob。多个文件时在本地打成**标准 TAR（不压缩）**，
+        // 接收端拿到一个 .tar，Windows / macOS / 7-Zip / Bandizip 都能直接打开，
+        // 文件名、顺序、时间戳都在。Blob 是惰性的，打包不会把内容读进内存。
         function handleFileSelect(event) {
-            const file = event.target.files[0];
-            if (file) processFile(file);
+            enqueueFiles(event.target.files);
+            event.target.value = '';          // 允许再次选同一个文件
         }
 
-        function processFile(file) {
-            sendState.file = file;
-            sendState.fileName = file.name;
-            sendState.fileSize = file.size;
+        function enqueueFiles(list) {
+            const files = Array.from(list || []).filter(f => f && typeof f.size === 'number');
+            if (!files.length) return;
+            sendState.queue = sendState.queue || [];
+            files.forEach(f => sendState.queue.push(f));
+            console.log('已排队 ' + sendState.queue.length + ' 个文件，合计 '
+                + formatFileSize(sendState.queue.reduce((a, f) => a + f.size, 0)));
+            renderQueue();
+        }
 
-            document.getElementById('fileName').textContent = file.name;
-            document.getElementById('fileSize').textContent = formatFileSize(file.size);
-            document.getElementById('fileInfo').classList.remove('hidden');
-            document.getElementById('dropZone').classList.add('hidden');
+        function removeQueueItem(i) {
+            (sendState.queue || []).splice(i, 1);
+            renderQueue();
+        }
 
-            updateStartButtonState();
+        function renderQueue() {
+            const q = sendState.queue || [];
+            const info = document.getElementById('fileInfo');
+            const zone = document.getElementById('dropZone');
+            const ul = document.getElementById('fileQueue');
+
+            if (!q.length) {
+                sendState.file = null;
+                sendState.fileName = '';
+                sendState.fileSize = 0;
+                if (ul) ul.textContent = '';
+                info.classList.add('hidden');
+                zone.classList.remove('hidden');
+                if (sendState.inputKind !== 'text') updateStartButtonState();
+                return;
+            }
+
+            const single = (q.length === 1);
+            sendState.file = single ? q[0] : buildTarBundle(q);
+            sendState.fileName = sendState.file.name;
+            sendState.fileSize = sendState.file.size;
+
+            document.getElementById('fileName').textContent = single
+                ? q[0].name
+                : '📦 ' + q.length + ' 个文件 → ' + sendState.file.name;
+            const total = q.reduce((a, f) => a + f.size, 0);
+            document.getElementById('fileSize').textContent = single
+                ? formatFileSize(q[0].size)
+                : '合计 ' + formatFileSize(total) + '，打包后 ' + formatFileSize(sendState.file.size);
+
+            if (ul) {
+                ul.textContent = '';
+                q.forEach((f, i) => {
+                    const li = document.createElement('li');
+                    li.className = 'flex items-center gap-2';
+                    const name = document.createElement('span');
+                    name.className = 'flex-1 truncate';
+                    name.textContent = (i + 1) + '. ' + f.name + ' · ' + formatFileSize(f.size);
+                    const del = document.createElement('button');
+                    del.className = 'text-red-400 shrink-0 font-bold';
+                    del.textContent = '✕';
+                    del.onclick = () => removeQueueItem(i);
+                    li.appendChild(name);
+                    li.appendChild(del);
+                    ul.appendChild(li);
+                });
+            }
+
+            info.classList.remove('hidden');
+            zone.classList.add('hidden');
+            if (sendState.inputKind !== 'text') updateStartButtonState();
+        }
+
+        // 标准 ustar：512 字节头 + 内容 + 512 对齐填充 + 1024 字节结束块
+        function buildTarBundle(files) {
+            const enc = new TextEncoder();
+            const parts = [];
+            const mtime = Math.floor(Date.now() / 1000);
+            const octal = (n, len) => n.toString(8).padStart(len - 1, '0') + '\0';
+
+            for (const f of files) {
+                const h = new Uint8Array(512);
+                let nameBytes = enc.encode(f.name);
+                if (nameBytes.length > 100) nameBytes = nameBytes.slice(0, 100);   // 超长名截断
+                h.set(nameBytes, 0);
+                h.set(enc.encode(octal(0o644, 8)), 100);      // mode
+                h.set(enc.encode(octal(0, 8)), 108);          // uid
+                h.set(enc.encode(octal(0, 8)), 116);          // gid
+                h.set(enc.encode(octal(f.size, 12)), 124);    // size
+                h.set(enc.encode(octal(mtime, 12)), 136);     // mtime
+                h.fill(0x20, 148, 156);                       // 校验和先填空格
+                h[156] = 0x30;                                // typeflag '0' = 普通文件
+                h.set(enc.encode('ustar\u000000'), 257);       // magic + version
+                let sum = 0;
+                for (let i = 0; i < 512; i++) sum += h[i];
+                h.set(enc.encode(sum.toString(8).padStart(6, '0') + '\0 '), 148);
+
+                parts.push(h, f);
+                const pad = (512 - (f.size % 512)) % 512;
+                if (pad) parts.push(new Uint8Array(pad));
+            }
+            parts.push(new Uint8Array(1024));   // 结束标记：两个全零块
+
+            return new File(parts, 'airscan-' + files.length + 'files.tar', { type: 'application/x-tar' });
         }
 
         // 安全获取 Emscripten 导出的 WASM 函数
@@ -720,12 +818,11 @@
                 : 'px-4 py-1.5 rounded-xl bg-white shadow-sm text-blue-600 transition-all';
 
             if (isFile) {
-                // 切回文件模式：丢弃文本载荷，等待用户重新选文件
-                clearFile(true);
+                // 切回文件模式：把之前排队的文件恢复出来（队列不丢）
+                renderQueue();
                 updateStartButtonState();
             } else {
-                // 切到文本模式：丢弃已选文件，改为同步文本框内容
-                clearFile(true);
+                // 切到文本模式：文本载荷接管，队列先留着，切回来还能接着用
                 syncTextPayload();
             }
         }
@@ -765,11 +862,15 @@
 
         // silent=true 时只清理状态，不刷新按钮（由调用方负责）
         function clearFile(silent) {
+            sendState.queue = [];
             sendState.file = null;
             sendState.fileName = '';
             sendState.fileSize = 0;
 
-            document.getElementById('fileInfo').classList.add('hidden');
+            const info = document.getElementById('fileInfo');
+            if (info) info.classList.add('hidden');
+            const ul = document.getElementById('fileQueue');
+            if (ul) ul.textContent = '';
             document.getElementById('dropZone').classList.remove('hidden');
             document.getElementById('fileInput').value = '';
 
@@ -2366,11 +2467,11 @@
                 if (!isFileDrag(e)) return;
                 e.preventDefault();
                 const dt = e.dataTransfer;
-                const file = dt && dt.files && dt.files[0];
+                const files = dt && dt.files;
                 // 先复位再读文件：后面处理无论怎么失败，页面都不会留在「拖动中」
-                const accepted = dropEnabled() && !!file;
+                const accepted = dropEnabled() && files && files.length > 0;
                 resetVisual();
-                if (accepted) processFile(file);
+                if (accepted) enqueueFiles(files);   // 一次拖入多个 = 全部入队
             }, true);
 
             // 切换标签 / 切换文件-文本模式时，别把「拖动中」的高亮带到下一个界面
